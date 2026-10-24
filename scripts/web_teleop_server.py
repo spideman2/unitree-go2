@@ -2,7 +2,7 @@
 # Copyright 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""v9-style browser controller backed by simple Go2 ROS 2 interfaces."""
+"""Browser controller backed by Go2 ROS 2 interfaces."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
-import threading
 import tempfile
+import threading
 import time
 from typing import Any
 from urllib.parse import urlsplit
@@ -28,7 +28,7 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, Int32, String
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from unitree_go2.srv import SetMode
@@ -199,15 +199,14 @@ class WebControl:
 class Camera:
     """One hardware encoder publishes RTSP; MediaMTX serves WebRTC to all viewers."""
 
-    def __init__(self, device: str = "auto", width: int = 640, height: int = 360, fps: int = 30,
-                 config: str = "") -> None:
+    def __init__(self, device: str = "auto", width: int = 640, height: int = 360, fps: int = 30) -> None:
         self.device, self.width, self.height, self.fps = device, width, height, max(1, fps)
-        self.config = config
         self._active_device = None
         self._processes = []
         self._logs = []
         self._fault = ""
         self._lock = threading.Lock()
+        self._watch_stop = threading.Event()
 
     def _candidates(self) -> list[str]:
         paths = ([Path(self.device)] if self.device != "auto" else
@@ -246,6 +245,7 @@ class Camera:
             connection.close()
 
     def _stop(self) -> None:
+        self._watch_stop.set()
         for process in reversed(self._processes):
             if process.poll() is None:
                 try:
@@ -266,6 +266,30 @@ class Camera:
         self._logs.clear()
         self._active_device = None
 
+    def _watch_viewers(self, stop: threading.Event) -> None:
+        last_viewer = time.monotonic()
+        while not stop.wait(1.0):
+            connection = HTTPConnection("127.0.0.1", 9997, timeout=0.5)
+            try:
+                connection.request("GET", "/v3/paths/get/camera")
+                response = connection.getresponse()
+                readers = json.loads(response.read(65536)).get("readers", []) if response.status == 200 else []
+            except (OSError, HTTPException, ValueError):
+                continue
+            finally:
+                connection.close()
+            with self._lock:
+                # An earlier monitor must never stop a newly opened camera.
+                if stop is not self._watch_stop or stop.is_set():
+                    return
+                if readers:
+                    last_viewer = time.monotonic()
+                elif time.monotonic() - last_viewer >= 15:
+                    # Allow WebRTC startup/reconnection, then release capture
+                    # when the browser has gone away or switched robots.
+                    self._stop()
+                    return
+
     def _failure(self, message: str) -> None:
         details = []
         for log in self._logs:
@@ -274,11 +298,11 @@ class Camera:
         self._fault = message + ("：" + "\n".join(filter(None, details)) if any(details) else "")
         self._stop()
 
-    def _start(self, arguments: list[str]) -> None:
+    def _start(self, arguments: list[str], env: dict[str, str] | None = None) -> None:
         log = tempfile.TemporaryFile()
         self._logs.append(log)
         self._processes.append(subprocess.Popen(
-            arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+            arguments, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=env,
         ))
 
     def set_enabled(self, enabled: bool) -> bool:
@@ -295,11 +319,28 @@ class Camera:
             if not candidates:
                 self._fault = "未识别到 USB 摄像头（1bcf:28c4），请检查 USB 接线和供电"
                 return False
-            if not shutil.which("mediamtx") or not shutil.which("ffmpeg") or not Path(self.config).is_file():
-                self._fault = "摄像头图传依赖未安装：需要 MediaMTX、FFmpeg 和 mediamtx.yaml"
+            if not shutil.which("mediamtx") or not shutil.which("ffmpeg"):
+                self._fault = "摄像头预览依赖未安装：需要 MediaMTX 和 FFmpeg"
                 return False
             try:
-                self._start(["mediamtx", self.config])
+                # MediaMTX v1.20.1: keep preview settings inside this child process.
+                # /dev/null skips config discovery; also discard legacy RTSP_ overrides.
+                env = {key: value for key, value in os.environ.items()
+                       if not key.startswith(("MTX_", "RTSP_"))}
+                env.update({
+                    "MTX_LOGLEVEL": "warn", "MTX_LOGDESTINATIONS": "stdout",
+                    "MTX_API": "true", "MTX_APIADDRESS": "127.0.0.1:9997",
+                    "MTX_METRICS": "false", "MTX_PPROF": "false", "MTX_PLAYBACK": "false",
+                    "MTX_RTSP": "true", "MTX_RTSPADDRESS": "127.0.0.1:18554",
+                    "MTX_RTSPTRANSPORTS": "tcp", "MTX_RTMP": "false", "MTX_HLS": "false",
+                    "MTX_SRT": "false", "MTX_MOQ": "false",
+                    "MTX_WEBRTC": "true", "MTX_WEBRTCADDRESS": ":8889",
+                    "MTX_WEBRTCENCRYPTION": "false", "MTX_WEBRTCALLOWORIGINS": "*",
+                    "MTX_WEBRTCLOCALUDPADDRESS": ":8189", "MTX_WEBRTCLOCALTCPADDRESS": "",
+                    "MTX_WEBRTCIPSFROMINTERFACES": "true", "MTX_WEBRTCADDITIONALHOSTS": "",
+                    "MTX_WEBRTCICESERVERS2": "", "MTX_PATHS_CAMERA_SOURCE": "publisher",
+                })
+                self._start(["mediamtx", "/dev/null"], env=env)
                 # Wait for this server to bind before starting its publisher.
                 deadline = time.monotonic() + 2
                 while time.monotonic() < deadline:
@@ -325,13 +366,15 @@ class Camera:
                     "-video_size", f"{self.width}x{self.height}", "-i", self._active_device,
                     "-an", "-vf", "format=nv12", "-c:v", "h264_stcodec", "-b:v", "1500k",
                     "-g", str(max(1, self.fps // 2)), "-bf", "0", "-flush_packets", "1",
-                    "-f", "rtsp", "-rtsp_transport", "tcp", "rtsp://127.0.0.1:8554/camera",
+                    "-f", "rtsp", "-rtsp_transport", "tcp", "rtsp://127.0.0.1:18554/camera",
                 ])
                 deadline = time.monotonic() + 3
                 while time.monotonic() < deadline:
                     if any(p.poll() is not None for p in self._processes):
                         break
                     if self._ready():
+                        self._watch_stop = threading.Event()
+                        threading.Thread(target=self._watch_viewers, args=(self._watch_stop,), daemon=True).start()
                         return True
                     time.sleep(0.05)
                 self._failure("摄像头未能输出 H.264 画面")
@@ -342,7 +385,7 @@ class Camera:
     def status(self) -> dict[str, Any]:
         with self._lock:
             if self._processes and any(p.poll() is not None for p in self._processes):
-                self._failure("摄像头图传进程已退出")
+                self._failure("摄像头预览进程已退出")
             return {
                 "enabled": len(self._processes) == 2,
                 "device": self._active_device or self.device,
@@ -356,98 +399,10 @@ class Camera:
         self.set_enabled(False)
 
 
-class FpvProcess:
-    """只管理本网页服务启动的天空端进程；运行状态不代表地面端收到了画面。"""
-
-    def __init__(self, executable: str, config: str, control_port: int, control_enabled: bool = False) -> None:
-        self.executable = executable
-        self.config = config
-        self.control_port = control_port
-        self._control_enabled = control_enabled
-        self._process = None
-        self._lock = threading.Lock()
-        self._fault = ""
-        self._closed = False
-
-    def _status(self) -> dict[str, Any]:
-        if not self._control_enabled:
-            return {"enabled": False, "available": False, "control_enabled": False,
-                    "mode": "native", "message": "图传暂未启用"}
-        if self._process is not None and self._process.poll() is not None:
-            self._fault = f"图传进程已退出（返回码 {self._process.returncode}），请检查服务日志"
-            self._process = None
-        executable = shutil.which(self.executable)
-        available = bool(executable and Path(self.config).is_file() and not self._closed)
-        return {"enabled": self._process is not None, "available": available,
-                "mode": "native", "control_enabled": True,
-                "message": self._fault or ("" if available else "图传程序或配置不可用")}
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            return self._status()
-
-    def set_enabled(self, enabled: bool) -> dict[str, Any]:
-        with self._lock:
-            state = self._status()
-            if enabled and not state["enabled"]:
-                if not state["available"]:
-                    return {**state, "success": False}
-                try:
-                    self._process = subprocess.Popen(
-                        [self.executable, "--config", self.config,
-                         "--control-port", str(self.control_port)],
-                        stdin=subprocess.DEVNULL, start_new_session=True,
-                    )
-                    self._fault = ""
-                    # 有界检查立即启动失败；后续轮询仍以真实进程状态为准。
-                    try:
-                        self._process.wait(timeout=0.25)
-                    except subprocess.TimeoutExpired:
-                        pass
-                except OSError as exc:
-                    self._fault = f"图传启动失败：{exc}"
-            elif not enabled and self._process is not None:
-                try:
-                    try:
-                        os.killpg(self._process.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    self._process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    # 超时保留进程句柄，允许查询和重试，不能误报已关闭。
-                    self._fault = "图传关闭超时，请重试并检查服务日志"
-                    return {**self._status(), "success": False}
-                except OSError as exc:
-                    self._fault = f"图传关闭失败：{exc}"
-                    return {**self._status(), "success": False}
-                self._process = None
-                self._fault = ""
-            state = self._status()
-            return {**state, "success": state["enabled"] == enabled and not self._closed}
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-        self.set_enabled(False)
-        with self._lock:
-            if self._process is not None:
-                try:
-                    try:
-                        os.killpg(self._process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    self._process.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired) as exc:
-                    self._fault = f"图传退出清理失败：{exc}"
-                else:
-                    self._process = None
-
-
 class Go2WebNode(Node):
     def __init__(self) -> None:
         super().__init__("go2_web")
         share = Path(get_package_share_directory("unitree_go2"))
-        self.share_root = share
         self.robot = str(self.declare_parameter("robot", "go2").value)
         if not valid_robot_id(self.robot):
             raise ValueError("unknown robot: " + self.robot)
@@ -489,22 +444,6 @@ class Go2WebNode(Node):
             int(self.declare_parameter("camera_width", 640).value),
             int(self.declare_parameter("camera_height", 360).value),
             int(self.declare_parameter("camera_fps", 30).value),
-            str(share / "config/mediamtx.yaml"),
-        )
-        prefix = share.parent.parent
-        fpv_port = int(self.declare_parameter("fpv_control_port", 8081).value)
-        if not 1 <= fpv_port <= 65535 or fpv_port == port:
-            raise ValueError("fpv_control_port must be valid and different from web_port")
-        # Keep native integration dormant until the SDK video pipeline is ready.
-        fpv_control_enabled = bool(self.declare_parameter("fpv_control_enabled", False).value)
-        fpv_executable = str(self.declare_parameter("fpv_executable", str(prefix / "bin/fpv_sky")).value)
-        fpv_config = str(self.declare_parameter("fpv_config", str(share / "config/fpv/sky.yaml")).value)
-        self.fpv = FpvProcess(fpv_executable, fpv_config, fpv_port, control_enabled=fpv_control_enabled)
-        self._capture_lock = threading.RLock()
-        self._fpv_rc_state = 0
-        self._fpv_rc_at = 0.0
-        self.fpv_rc_sub = self.create_subscription(
-            Int32, "/go2/fpv/rc_state", self.update_fpv_rc, 1
         )
         self.http = ThreadingHTTPServer(("0.0.0.0", port), self.handler())
         self.http.daemon_threads = True
@@ -532,7 +471,7 @@ class Go2WebNode(Node):
             raise
         self.http_thread.start()
         self.network.start()
-        self.get_logger().info(f"Go2 v9-style web controller listening on port {port}")
+        self.get_logger().info(f"Go2 web controller listening on port {port}")
 
     def publish_velocity(self, force: bool = False) -> None:
         with self._lock:
@@ -601,32 +540,6 @@ class Go2WebNode(Node):
         self.set_velocity((0.0, 0.0, 0.0))
         self.publish_velocity(force=True)
 
-    def fpv_status(self) -> dict[str, Any]:
-        with self._capture_lock:
-            state = self.fpv.status()
-            remote = (state["control_enabled"] and self._fpv_rc_state != 0
-                      and time.monotonic() - self._fpv_rc_at <= 0.5)
-            return {**state, "remote_controlled": remote,
-                    "rc_enabled": self._fpv_rc_state == 2 if remote else None}
-
-    def update_fpv_rc(self, message: Int32) -> None:
-        """0 = disconnected, 1 = A off, 2 = A on."""
-        if not self.fpv.status()["control_enabled"] or message.data not in (0, 1, 2):
-            return
-        with self._capture_lock:
-            previous = self._fpv_rc_state if time.monotonic() - self._fpv_rc_at <= 0.5 else 0
-            self._fpv_rc_state = message.data
-            self._fpv_rc_at = time.monotonic()
-            if message.data == 0 or message.data == previous:
-                return
-            enabled = message.data == 2
-            if enabled and self.camera.status()["enabled"]:
-                self.get_logger().warning("请先关闭网页摄像头，再通过 A 打开图传")
-                return
-            result = self.fpv.set_enabled(enabled)
-            if not result["success"]:
-                self.get_logger().warning("遥控器图传请求失败：" + str(result["message"]))
-
     def set_mode(self, requested: str) -> dict[str, Any]:
         if requested not in MODES:
             raise CommandError("unknown mode")
@@ -670,9 +583,8 @@ class Go2WebNode(Node):
         return self.mode_client.service_is_ready() and time.monotonic() - self._status_received_at < 3.0
 
     def status(self) -> dict[str, Any]:
-        # Process shutdown may wait up to two seconds. Keep it outside the
-        # velocity lock so joystick reception and publication remain responsive.
-        fpv = self.fpv_status()
+        # Process cleanup must not block joystick reception on the velocity lock.
+        camera = {**self.camera.status(), "webrtc_host": self.network.address}
         with self._lock:
             age = None if not self._velocity_at else round((time.monotonic() - self._velocity_at) * 1000)
             velocity = self._velocity if age is not None and age <= COMMAND_TIMEOUT * 1000 else (0.0, 0.0, 0.0)
@@ -689,12 +601,10 @@ class Go2WebNode(Node):
                 "last_mode": self._last_mode,
                 "last_accepted": self._last_result["accepted"],
                 "last_message": self._last_result["message"],
+                "camera": camera,
                 "control_transport": "webrtc",
                 "navigation_enabled": self._navigation_enabled,
                 "ai_agent_enabled": self._ai_agent_enabled,
-                "camera": self.camera.status(),
-                "fpv": fpv,
-                "audio": {"playing": False},
             }
 
     def handler(self):
@@ -760,18 +670,14 @@ class Go2WebNode(Node):
                     return None
                 robot, suffix = parts[3:]
                 allowed = {
-                    "status", "command", "stop", "light/toggle", "camera/status",
-                    "camera/toggle", "audio/play", "rtc/offer", "mode",
-                    "fpv/status", "fpv/capture",
+                    "status", "command", "stop", "light/toggle", "rtc/offer", "mode",
+                    "camera/status", "camera/toggle",
                 }
                 if suffix not in allowed:
                     self.send_json(404, {"error": "unknown robot API"})
                     return None
                 route = "/api/" + suffix
                 if robot == node.robot:
-                    if self.command == "POST" and suffix != "fpv/capture" and not node.controller_ready():
-                        self.send_json(503, {"error": "robot controller is not running"})
-                        return None
                     return route
                 endpoint = node.network.endpoint(robot)
                 if endpoint is None:
@@ -818,16 +724,12 @@ class Go2WebNode(Node):
                 if path == "/api/camera/status":
                     self.send_json(200, node.camera.status())
                     return
-                if path == "/api/fpv/status":
-                    self.send_json(200, node.fpv_status())
-                    return
                 if path not in static:
                     self.send_json(404, {"error": "not found"})
                     return
                 filename, content_type = static[path]
                 try:
-                    asset_root = node.share_root if filename.startswith("tool/") else node.web_root
-                    data = (asset_root / filename).read_bytes()
+                    data = (node.web_root / filename).read_bytes()
                 except OSError:
                     self.send_json(404, {"error": "web asset unavailable"})
                     return
@@ -847,7 +749,7 @@ class Go2WebNode(Node):
                     path = self.robot_route()
                     if path is None:
                         return
-                    if path != "/api/fpv/capture" and not node.controller_ready():
+                    if path != "/api/camera/toggle" and not node.controller_ready():
                         self.send_json(503, {"error": "robot controller is not running"})
                         return
                     payload = self.body()
@@ -882,33 +784,14 @@ class Go2WebNode(Node):
                     if path == "/api/camera/toggle":
                         if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
                             raise CommandError("enabled must be a boolean")
-                        with node._capture_lock:
-                            fpv_state = node.fpv.status()
-                            if payload["enabled"] and fpv_state["enabled"]:
-                                self.send_json(409, {"error": "请先关闭图传，再打开网页摄像头"})
-                                return
-                            enabled = node.camera.set_enabled(payload["enabled"])
+                        if payload["enabled"] and not node.controller_ready():
+                            self.send_json(503, {"error": "robot controller is not running"})
+                            return
+                        enabled = node.camera.set_enabled(payload["enabled"])
                         if payload["enabled"] and not enabled:
                             self.send_json(503, {"error": node.camera.status()["message"]})
                             return
                         self.send_json(200, {**node.camera.status(), "webrtc_host": node.network.address})
-                        return
-                    if path == "/api/fpv/capture":
-                        if not isinstance(payload, dict) or not isinstance(payload.get("enabled"), bool):
-                            raise CommandError("enabled must be a boolean")
-                        with node._capture_lock:
-                            if node.fpv_status()["remote_controlled"]:
-                                self.send_json(409, {"error": "遥控器已连接，请通过 A 开关图传"})
-                                return
-                            if payload["enabled"] and node.camera.status()["enabled"]:
-                                self.send_json(409, {"error": "请先关闭网页摄像头，再打开图传"})
-                                return
-                            result = node.fpv.set_enabled(payload["enabled"])
-                            result.update(remote_controlled=False, rc_enabled=None)
-                        self.send_json(200 if result["success"] else 503, result)
-                        return
-                    if path == "/api/audio/play":
-                        self.send_json(503, {"error": "audio player is not included in simple target"})
                         return
                     if path == "/api/stop":
                         node.stop()
@@ -934,7 +817,6 @@ class Go2WebNode(Node):
             if rclpy.ok():
                 self.stop()
             self.camera.close()
-            self.fpv.close()
             self.http.shutdown()
             self.http.server_close()
         finally:

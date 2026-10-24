@@ -17,7 +17,7 @@ KillMode=mixed
 TimeoutStopSec=50
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=go2-sdk
+SyslogIdentifier=go2
 
 [Install]
 WantedBy=multi-user.target

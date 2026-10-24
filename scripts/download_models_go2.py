@@ -2,7 +2,7 @@
 # Copyright 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""Download and verify the Go2 models listed in config/model_manifest.yaml."""
+"""Download and verify the Go2 model_manifest in config/policies.yaml."""
 
 import argparse
 import hashlib
@@ -20,7 +20,7 @@ import yaml
 
 def application_root():
     root = Path(__file__).resolve().parents[1]
-    if (root / "config/model_manifest.yaml").is_file():
+    if (root / "config/policies.yaml").is_file():
         return root
     from ament_index_python.packages import get_package_share_directory
     return Path(get_package_share_directory("unitree_go2"))
@@ -70,7 +70,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="Verify local files without downloading")
     args = parser.parse_args()
     root = application_root()
-    manifest = yaml.safe_load((root / "config/model_manifest.yaml").read_text())
+    manifest = yaml.safe_load((root / "config/policies.yaml").read_text())["model_manifest"]
     destination = args.output or root / "policy"
     base_url = (args.base_url or manifest["archive"]["base_url"]).rstrip("/") + "/"
     missing = []
@@ -95,7 +95,10 @@ def main():
             shutil.copyfile(source, target)
             print(f"Copied {name} from training archive", flush=True)
             continue
-        download_model(urljoin(base_url, quote(name)), target, entry)
+        remote = PurePosixPath(entry.get("remote_path", name))
+        if remote.is_absolute() or ".." in remote.parts:
+            raise ValueError(f"Invalid model archive path: {remote}")
+        download_model(urljoin(base_url, quote(str(remote))), target, entry)
     if missing:
         print("Missing or invalid assets:\n" + "\n".join(missing), file=sys.stderr)
         return 1

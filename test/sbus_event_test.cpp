@@ -28,32 +28,6 @@ struct SbusTeleopTestAccess {
             assert(teleop->mode_for_slot(slot) == modes[slot - 1]);
         }
     }
-
-    static void check_fpv_state() {
-        auto teleop = std::shared_ptr<SbusTeleopNode>(new SbusTeleopNode(false));
-        const auto now = Clock::now();
-        assert(teleop->fpv_rc_state(now) == 0);
-        rc_receiver_frame_t frame{};
-        frame.channel_count = kGo2EffectiveChannelCount;
-        for (auto& channel : frame.channels) channel = RC_RECEIVER_CHANNEL_MAX / 2;
-        frame.channels[6] = 0;  // CH7 / A off.
-        teleop->handle_frame(frame, now);
-        assert(teleop->fpv_rc_state(now) == 1);
-        frame.channels[6] = RC_RECEIVER_CHANNEL_MAX;
-        teleop->handle_frame(frame, now);
-        assert(teleop->fpv_rc_state(now) == 2);
-        teleop->handle_frame(frame, now);
-        assert(teleop->fpv_rc_state(now) == 2);
-        frame.channels[6] = 0;
-        teleop->handle_frame(frame, now);
-        assert(teleop->fpv_rc_state(now) == 1);
-        frame.flags = RC_RECEIVER_FLAG_FAILSAFE;
-        teleop->handle_frame(frame, now);
-        assert(teleop->fpv_rc_state(now) == 0);
-        frame.flags = 0;
-        teleop->handle_frame(frame, now);
-        assert(teleop->fpv_rc_state(now + std::chrono::seconds(1)) == 0);
-    }
 };
 
 }  // namespace
@@ -101,7 +75,6 @@ int main(int argc, char** argv) {
     assert(!batch->overflow && batch->count == 0);
     node->get_node_waitables_interface()->remove_waitable(event, nullptr);
     executor.remove_node(node);
-    SbusTeleopTestAccess::check_fpv_state();
     SbusTeleopTestAccess::check_mode_mapping();
     rclcpp::shutdown();
 }

@@ -37,7 +37,7 @@ def default_config(name):
                   script.parents[4] / "share/unitree_go2/config" / name]
     if name.startswith("calibration_pose_"):
         candidates.insert(0, script.with_name(name))
-        candidates.insert(1, script.parents[4] / "share/unitree_go2/tool/1.calibration" / name)
+        candidates.insert(1, script.parents[4] / "share/unitree_go2/tool/calibration" / name)
     for source in candidates:
         if source.is_file():
             return source
@@ -47,9 +47,10 @@ def default_config(name):
 def load_config(path):
     """Resolve shared defaults and board wiring before applying local calibration."""
     local = yaml.safe_load(Path(path).read_text())
-    params = yaml.safe_load(default_config("go2.yaml").read_text())["go2"]["ros__parameters"]
+    shared = yaml.safe_load(default_config("robot.yaml").read_text())
+    params = {**shared["defaults"], **local.get("defaults", {})}
     board = local.get("robot", {}).get("board_profile", "legacy_usb")
-    profiles = yaml.safe_load(default_config("board_profiles.yaml").read_text())
+    profiles = {**shared["board_profiles"], **local.get("board_profiles", {})}
     if board not in profiles:
         raise ValueError("unknown board_profile: " + board)
     params.update(profiles[board]["go2"])
@@ -89,82 +90,14 @@ def validate(config, reference):
     if reference["joint_order"] != JOINTS:
         raise ValueError("reference joint_order must be FR/FL/RR/RL; hip/thigh/calf")
     finite_vector(params["startup_reference_joint_positions_rad"], "startup pose")
-    pose = [math.radians(x) for x in
-            finite_vector(reference["joint_positions_deg"], "Pose E")]
-    return params, pose
-
-
-def rotor_means(directory, samples):
-    if samples < 1:
-        raise ValueError("samples must be positive")
-    sdk = directory / "sdk" if (directory / "sdk").is_dir() else directory
-    means = []
-    for index, joint in enumerate(JOINTS):
-        path = sdk / f"{joint[:2]}_id{index % 3}.txt"
-        text = path.read_text(encoding="ascii")
-        replies = REPLY.findall(text)
-        if len(replies) != samples or len(re.findall(r"\breply id=", text)) != samples:
-            raise ValueError(f"{path}: expected exactly {samples} replies")
-        values = []
-        for motor_id, error, q in replies:
-            if int(motor_id) != index % 3 or int(error) != 0:
-                raise ValueError(f"{path}: wrong motor ID or motor error")
-            value = float(q)
-            if not math.isfinite(value):
-                raise ValueError(f"{path}: non-finite rotor position")
-            values.append(value)
-        # Reject motion or an encoder wrap during the fixed-pose sample window.
-        spread = math.degrees((max(values) - min(values)) / RATIOS[index])
-        if spread > 0.1:
-            raise ValueError(f"{path}: joint spread {spread:.4f} deg exceeds 0.1 deg")
-        means.append(statistics.fmean(values))
-    return means
-
-
-def generate(config, reference, means):
-    result = copy.deepcopy(config)
-    params, pose = validate(result, reference)
-    finite_vector(means, "rotor means")
-    startup = params["startup_reference_joint_positions_rad"]
-    params["joint_zero_offsets_rad"] = [
-        round(q - direction * rotor / ratio, 9)
-        for q, direction, rotor, ratio in zip(pose, DIRECTIONS, means, RATIOS)]
-    # Keep the Pose A anchor on the same rotor-turn branch as this capture.
-    params["startup_reference_rotor_positions_rad"] = [
-        round(rotor + direction * (a - e) * ratio, 9)
-        for rotor, direction, a, e, ratio in zip(means, DIRECTIONS, startup, pose, RATIOS)]
-    return result
-
-
-def capture(directory, config, reference, tool, samples):
-    params, _ = validate(config, reference)
-    ports = params["serial_devices"]
-    if (len(ports) != 4 or any(not isinstance(p, str) or not p.startswith("/dev/")
-                               for p in ports) or
-            len({Path(p).resolve() for p in ports}) != 4):
-        raise ValueError("serial_devices must name four distinct device paths")
-    if not tool.is_file():
-        raise ValueError(f"BRAKE tool not found: {tool}; build unitree_go2 first")
-    for port in ports:
-        if not Path(port).exists():
-            raise ValueError(f"missing motor port: {port}")
-    busy = subprocess.run(["fuser", *ports], capture_output=True, text=True, check=False)
-    if busy.returncode != 1 or busy.stdout.strip() or busy.stderr.strip():
-        raise ValueError(f"motor ports busy or occupancy check failed: {busy.stdout}{busy.stderr}")
-    directory.mkdir(parents=True, exist_ok=False)
-    (directory / "sdk").mkdir()
-    (directory / "base_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
-    (directory / "reference.yaml").write_text(yaml.safe_dump(reference, sort_keys=False))
-    for index, joint in enumerate(JOINTS):
-        path = directory / "sdk" / f"{joint[:2]}_id{index % 3}.txt"
-        with path.open("x", encoding="ascii") as log:
-            subprocess.run([str(tool), ports[index // 3], str(index % 3), str(samples)],
-                           stdout=log, stderr=subprocess.STDOUT, check=True, timeout=30)
-        print(f"Captured {joint}: {samples} BRAKE replies", flush=True)
+    finite_vector(reference["joint_positions_deg"], "XYZ reference joint positions")
+    return params
 
 
 def phase_rotor_means(directory, phase, samples):
     """Read and validate only the motors sampled for one pose."""
+    if samples < 1:
+        raise ValueError("samples must be positive")
     sdk = directory / "sdk" if (directory / "sdk").is_dir() else directory
     means = {}
     for index in PHASES[phase]:
@@ -197,7 +130,7 @@ def phase_reference(reference, phase):
 def update_phase(config, phase, reference, rotor_means_by_index):
     """Update offsets and Pose A rotor anchors for this phase only."""
     result = copy.deepcopy(config)
-    params = result["go2"]["ros__parameters"]
+    params = validate(result, reference)
     references = phase_reference(reference, phase)
     offsets = params["joint_zero_offsets_rad"]
     startup_joint = params["startup_reference_joint_positions_rad"]
@@ -210,7 +143,7 @@ def update_phase(config, phase, reference, rotor_means_by_index):
 
 
 def capture_phase(directory, config, reference, tool, samples, phase):
-    params, _ = validate(config, reference)
+    params = validate(config, reference)
     ports = params["serial_devices"]
     if (len(ports) != 4 or any(not isinstance(port, str) or not port.startswith("/dev/")
                                for port in ports) or
@@ -362,8 +295,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", type=Path, nargs="*")
     parser.add_argument("--interactive", action="store_true", help="guide all XYZ stages; default without paths")
-    parser.add_argument("--mode", choices=("poseE", "poseXYZ"),
-                        help="poseE: legacy single pose; poseXYZ: three phases (interactive without paths)")
     parser.add_argument("--phase", choices=tuple(PHASES),
                         help="phase to capture; omit when combining the three captures")
     parser.add_argument("--capture", action="store_true", help="sample BRAKE feedback for this phase")
@@ -379,7 +310,7 @@ def main():
     if args.output is not None and args.output.exists():
         parser.error("output already exists; choose a new file")
     if args.interactive or not args.paths:
-        if len(args.paths) > 1 or args.capture or args.phase or args.mode == "poseE":
+        if len(args.paths) > 1 or args.capture or args.phase:
             parser.error("interactive calibration uses poseXYZ with at most one new capture directory")
         directory = args.paths[0] if args.paths else (
             Path(os.environ.get("SROBOTIS_OUTPUT_ROOT", "output")) / "calibration" /
@@ -389,39 +320,6 @@ def main():
             args.reference or default_config("calibration_pose_xyz.yaml"), args.tool, args.samples,
             args.output or directory / "calibrated.yaml")
         return
-    args.mode = args.mode or "poseE"
-    if args.mode == "poseE":
-        if args.phase:
-            parser.error("--phase is only valid with --mode poseXYZ")
-        if len(args.paths) != 1 or args.output is None:
-            parser.error("poseE requires one CAPTURE_DIR and --output")
-        saved_base = args.paths[0] / "base_config.yaml"
-        base_path = args.base_config or (
-            saved_base if not args.capture and saved_base.is_file()
-            else Path(os.environ.get("GO2_LOCAL_CONFIG", "/etc/unitree-go2/robot.yaml"))
-        )
-        reference_path = args.reference or default_config("calibration_pose_e.yaml")
-        config = load_config(base_path)
-        reference = yaml.safe_load(reference_path.read_text())
-        validate(config, reference)
-        if args.capture:
-            capture(args.paths[0], config, reference, args.tool, args.samples)
-        else:
-            saved_base = args.paths[0] / "base_config.yaml"
-            saved_reference = args.paths[0] / "reference.yaml"
-            if args.base_config is None and saved_base.is_file():
-                config = yaml.safe_load(saved_base.read_text())
-            if args.reference is None and saved_reference.is_file():
-                reference = yaml.safe_load(saved_reference.read_text())
-            validate(config, reference)
-        means = rotor_means(args.paths[0], args.samples)
-        result = generate(config, reference, means)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("x") as stream:
-            yaml.safe_dump(result, stream, sort_keys=False)
-        print(f"Generated {args.output}; runtime startup remains the base config Pose A")
-        return
-
     if args.phase:
         if len(args.paths) != 1 or not args.capture:
             parser.error("phase capture requires CAPTURE_DIR --phase poseX|poseY|poseZ --capture")

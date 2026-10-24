@@ -1,7 +1,7 @@
 # Copyright 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
 #
 # SPDX-License-Identifier: Apache-2.0
-"""隔离验证网页图传生命周期，不启动 ROS 或图传程序。"""
+"""隔离验证网页控制、摄像头预览与网络请求，不启动 ROS 或硬件。"""
 
 import ast
 from http.client import HTTPConnection, HTTPException
@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -24,30 +25,23 @@ from urllib.parse import urlsplit
 
 source = Path(__file__).resolve().parents[1] / "scripts/web_teleop_server.py"
 tree = ast.parse(source.read_text())
-definitions = [item for item in tree.body
-               if isinstance(item, ast.ClassDef) and item.name in {"FpvProcess", "Camera"}]
-namespace = {"Path": Path, "os": os, "shutil": shutil, "signal": signal,
-             "subprocess": subprocess, "threading": threading, "tempfile": __import__("tempfile"),
-             "json": json, "time": time, "Any": object}
-exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)
-FpvProcess = namespace["FpvProcess"]
-Camera = namespace["Camera"]
 web_node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "Go2WebNode")
-handler = next(item for item in web_node.body if isinstance(item, ast.FunctionDef) and item.name == "handler")
 with patch.dict("sys.modules", {"dbus": Mock()}):
     network_module = runpy.run_path(str(source.with_name("go2_network.py")))
-namespace.update({"BaseHTTPRequestHandler": BaseHTTPRequestHandler, "json": json,
-                  "urlsplit": urlsplit, "CommandError": ValueError, "time": time,
-                  "HTTPConnection": HTTPConnection, "HTTPException": HTTPException,
-                  "APPLICATION_ID": "unitree-go2-sdk",
-                  "valid_robot_id": network_module["valid_robot_id"]})
-exec(compile(ast.Module(body=[handler], type_ignores=[]), str(source), "exec"), namespace)
+namespace = {"BaseHTTPRequestHandler": BaseHTTPRequestHandler, "json": json,
+             "urlsplit": urlsplit, "CommandError": ValueError, "time": time, "Any": object,
+             "HTTPConnection": HTTPConnection, "HTTPException": HTTPException,
+             "APPLICATION_ID": "unitree-go2-sdk", "valid_robot_id": network_module["valid_robot_id"]}
 namespace["MODES"] = ast.literal_eval(next(item.value for item in tree.body
     if isinstance(item, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "MODES"
                                            for target in item.targets)))
-for name in ("fpv_status", "update_fpv_rc", "set_mode"):
+namespace.update({"Path": Path, "os": os, "shutil": shutil, "signal": signal,
+                  "subprocess": subprocess, "threading": threading, "tempfile": tempfile})
+camera_class = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "Camera")
+exec(compile(ast.Module(body=[camera_class], type_ignores=[]), str(source), "exec"), namespace)
+Camera = namespace["Camera"]
+for name in ("handler", "set_mode"):
     method = next(item for item in web_node.body if isinstance(item, ast.FunctionDef) and item.name == name)
-    namespace["Int32"] = SimpleNamespace
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
 
 
@@ -86,9 +80,111 @@ class CameraTests(unittest.TestCase):
             self.assertIn("USB disconnected", state["message"])
             kill.assert_called_once_with(server.pid, signal.SIGTERM)
             server.wait.assert_called_once_with(timeout=1)
-            publisher.wait.assert_not_called()
         self.assertTrue(log.closed)
         self.assertEqual(camera._processes, [])
+
+    def test_preview_publisher_matches_server_without_navigation_rtsp_port(self):
+        camera = Camera()
+
+        def start(*_args, **_kwargs):
+            process = Mock(pid=999999)
+            process.poll.return_value = None
+            return process
+
+        connection = Mock()
+        connection.getresponse.return_value.status = 200
+        inherited = {
+            "MTX_RTSPADDRESS": ":8554", "MTX_PATHS_UNWANTED_SOURCE": "publisher",
+            "MTX_RUNONCONNECT": "unexpected-command", "RTSP_CONFKEY": "unrelated-key",
+            "RTSP_RTSPADDRESS": ":8555", "GO2_PREVIEW_TEST_MARKER": "preserved",
+        }
+        with patch.object(camera, "_candidates", return_value=["/dev/video3"]), \
+                patch.object(shutil, "which", return_value="/usr/bin/executable"), \
+                patch.object(subprocess, "Popen", side_effect=start) as popen, \
+                patch.object(camera, "_ready", return_value=True), \
+                patch.dict(namespace, {"HTTPConnection": Mock(return_value=connection)}), \
+                patch.dict(os.environ, inherited), patch.object(os, "killpg"), \
+                patch.object(threading, "Thread") as thread:
+            try:
+                for cycle in range(2):
+                    previous_stop = camera._watch_stop
+                    self.assertTrue(camera.set_enabled(True))
+                    self.assertTrue(camera.set_enabled(True))
+                    self.assertEqual(popen.call_count, 2 * (cycle + 1))
+                    self.assertEqual(thread.call_count, cycle + 1)
+                    self.assertIsNot(camera._watch_stop, previous_stop)
+                    server, publisher = popen.call_args_list[-2:]
+                    self.assertEqual(server.args[0], ["mediamtx", "/dev/null"])
+                    env = server.kwargs["env"]
+                    self.assertEqual(env["MTX_APIADDRESS"], "127.0.0.1:9997")
+                    self.assertEqual(env["MTX_WEBRTCADDRESS"], ":8889")
+                    self.assertEqual(env["MTX_WEBRTCLOCALUDPADDRESS"], ":8189")
+                    self.assertEqual(env["MTX_RTSPTRANSPORTS"], "tcp")
+                    self.assertEqual(env["MTX_PATHS_CAMERA_SOURCE"], "publisher")
+                    self.assertEqual(env["GO2_PREVIEW_TEST_MARKER"], "preserved")
+                    for key, value in inherited.items():
+                        self.assertEqual(os.environ[key], value)
+                        if key not in ("MTX_RTSPADDRESS", "GO2_PREVIEW_TEST_MARKER"):
+                            self.assertNotIn(key, env)
+                    destination = urlsplit(publisher.args[0][-1])
+                    self.assertEqual(destination.netloc, env["MTX_RTSPADDRESS"])
+                    self.assertEqual(destination.port, 18554)
+                    self.assertEqual(destination.path, "/camera")
+                    self.assertIn("h264_stcodec", publisher.args[0])
+                    logs, processes = list(camera._logs), list(camera._processes)
+                    self.assertFalse(camera.set_enabled(False))
+                    self.assertTrue(camera._watch_stop.is_set())
+                    self.assertTrue(all(log.closed for log in logs))
+                    for process in processes:
+                        process.wait.assert_called_once_with(timeout=1)
+                    self.assertEqual(camera._processes, [])
+                    self.assertEqual(camera._logs, [])
+                    self.assertIsNone(camera._active_device)
+            finally:
+                camera.close()
+
+    def test_preview_stops_after_browser_leaves_or_never_connects(self):
+        for readers, clock in (([[], []], [0, 5, 16]), ([[{"type": "webRTCSession"}], []], [0, 10, 26])):
+            with self.subTest(readers=readers):
+                camera = Camera()
+                process = Mock(pid=999999)
+                process.poll.return_value = None
+                camera._processes = [process, process]
+                connection = Mock()
+                connection.getresponse.return_value.status = 200
+                connection.getresponse.return_value.read.side_effect = [
+                    json.dumps({"readers": value}).encode() for value in readers
+                ]
+                with patch.dict(namespace, {"HTTPConnection": Mock(return_value=connection)}), \
+                        patch.object(time, "monotonic", side_effect=clock), \
+                        patch.object(camera._watch_stop, "wait", return_value=False), \
+                        patch.object(os, "killpg"):
+                    camera._watch_viewers(camera._watch_stop)
+                self.assertFalse(camera.status()["enabled"])
+                self.assertTrue(camera._watch_stop.is_set())
+
+    def test_previous_monitor_cannot_stop_reopened_camera(self):
+        camera = Camera()
+        previous = camera._watch_stop
+        process = Mock()
+        process.poll.return_value = None
+        camera._processes = [process, process]
+        connection = Mock()
+        response = Mock(status=200)
+        response.read.return_value = b'{"readers": []}'
+
+        def reopens():
+            camera._watch_stop = threading.Event()
+            return response
+
+        connection.getresponse.side_effect = reopens
+        with patch.dict(namespace, {"HTTPConnection": Mock(return_value=connection)}), \
+                patch.object(previous, "wait", return_value=False), \
+                patch.object(time, "monotonic", side_effect=[0, 100]), \
+                patch.object(os, "killpg") as kill:
+            camera._watch_viewers(previous)
+        kill.assert_not_called()
+        self.assertTrue(camera.status()["enabled"])
 
 
 class WifiStartupTests(unittest.TestCase):
@@ -237,187 +333,19 @@ class WifiStartupTests(unittest.TestCase):
                         network.close()
 
 
-class FpvProcessTests(unittest.TestCase):
-    def setUp(self):
-        self.manager = FpvProcess("fpv_sky", str(source), 8081, control_enabled=True)
-
-    def test_native_is_disabled_by_default_without_probing_or_starting(self):
-        with patch.object(shutil, "which") as probe, patch.object(subprocess, "Popen") as start, \
-                patch.object(subprocess, "run") as command:
-            manager = FpvProcess("fpv_sky", str(source), 8081)
-            state = manager.status()
-            self.assertEqual(state["mode"], "native")
-            self.assertFalse(state["control_enabled"])
-            self.assertFalse(state["available"])
-            self.assertFalse(state["enabled"])
-            self.assertFalse(manager.set_enabled(True)["success"])
-            self.assertTrue(manager.set_enabled(False)["success"])
-            manager.close()
-            probe.assert_not_called()
-            start.assert_not_called()
-            command.assert_not_called()
-
-    def test_missing_binary_does_not_start(self):
-        with patch.object(shutil, "which", return_value=None), patch.object(subprocess, "Popen") as start:
-            self.assertFalse(self.manager.set_enabled(True)["success"])
-            start.assert_not_called()
-
-    def test_start_is_idempotent_and_stop_reaps_owned_process(self):
-        process = Mock(pid=123)
-        process.poll.return_value = None
-        process.wait.side_effect = [subprocess.TimeoutExpired("fpv_sky", 0.25), 0]
-        with patch.object(shutil, "which", return_value="/bin/fpv_sky"), \
-                patch.object(subprocess, "Popen", return_value=process) as start, \
-                patch.object(os, "killpg") as kill:
-            self.assertTrue(self.manager.set_enabled(True)["success"])
-            self.assertTrue(self.manager.set_enabled(True)["enabled"])
-            start.assert_called_once_with(
-                ["fpv_sky", "--config", str(source), "--control-port", "8081"],
-                stdin=subprocess.DEVNULL, start_new_session=True,
-            )
-            self.assertTrue(self.manager.set_enabled(False)["success"])
-            kill.assert_called_once_with(123, signal.SIGTERM)
-
-    def test_immediate_exit_is_reported_as_failure(self):
-        process = Mock(returncode=2)
-        process.poll.return_value = 2
-        with patch.object(shutil, "which", return_value="/bin/fpv_sky"), \
-                patch.object(subprocess, "Popen", return_value=process):
-            result = self.manager.set_enabled(True)
-            self.assertFalse(result["success"])
-            self.assertIn("返回码 2", result["message"])
-
-    def test_stop_timeout_keeps_process_for_retry(self):
-        process = Mock(pid=123)
-        process.poll.return_value = None
-        process.wait.side_effect = subprocess.TimeoutExpired("fpv_sky", 2)
-        self.manager._process = process
-        with patch.object(os, "killpg"), patch.object(shutil, "which", return_value="/bin/fpv_sky"):
-            result = self.manager.set_enabled(False)
-            self.assertFalse(result["success"])
-            self.assertTrue(result["enabled"])
-            self.assertIs(self.manager._process, process)
-
-    def test_missing_process_with_wait_timeout_is_handled(self):
-        process = Mock(pid=123)
-        process.poll.return_value = None
-        process.wait.side_effect = subprocess.TimeoutExpired("fpv_sky", 2)
-        self.manager._process = process
-        with patch.object(os, "killpg", side_effect=ProcessLookupError):
-            self.assertFalse(self.manager.set_enabled(False)["success"])
-            self.assertIs(self.manager._process, process)
-
-    def test_stop_os_error_is_reported(self):
-        process = Mock(pid=123)
-        process.poll.return_value = None
-        self.manager._process = process
-        with patch.object(os, "killpg", side_effect=PermissionError("denied")):
-            self.assertFalse(self.manager.set_enabled(False)["success"])
-            self.assertIs(self.manager._process, process)
-
-    def test_close_escalates_after_stop_timeout(self):
-        process = Mock(pid=123)
-        process.poll.return_value = None
-        process.wait.side_effect = [subprocess.TimeoutExpired("fpv_sky", 2), 0]
-        self.manager._process = process
-        with patch.object(os, "killpg") as kill:
-            self.manager.close()
-            self.assertEqual(kill.call_args_list,
-                             [unittest.mock.call(123, signal.SIGTERM),
-                              unittest.mock.call(123, signal.SIGKILL)])
-            self.assertIsNone(self.manager._process)
-
-    def test_close_prevents_late_restart(self):
-        with patch.object(shutil, "which", return_value="/bin/fpv_sky"), \
-                patch.object(subprocess, "Popen") as start:
-            self.manager.close()
-            self.assertFalse(self.manager.set_enabled(True)["success"])
-            start.assert_not_called()
-
-
-class FpvRemoteTests(unittest.TestCase):
-    def setUp(self):
-        self.fpv = Mock()
-        self.fpv.status.return_value = {"enabled": False, "available": True,
-                                        "mode": "native", "control_enabled": True}
-        self.fpv.set_enabled.return_value = {"success": True}
-        self.camera = Mock()
-        self.camera.status.return_value = {"enabled": False}
-        self.node = SimpleNamespace(
-            fpv=self.fpv, camera=self.camera, _capture_lock=threading.RLock(),
-            _fpv_rc_state=0, _fpv_rc_at=0.0, get_logger=lambda: Mock(),
-        )
-
-    def frame(self, state):
-        namespace["update_fpv_rc"](self.node, SimpleNamespace(data=state))
-
-    def test_default_is_web_control_off(self):
-        state = namespace["fpv_status"](self.node)
-        self.assertFalse(state["remote_controlled"])
-        self.assertFalse(state["enabled"])
-        self.fpv.set_enabled.assert_not_called()
-
-    def test_disabled_native_ignores_a_and_does_not_report_capture_on(self):
-        self.fpv.status.return_value.update(control_enabled=False, available=False)
-        self.frame(2)
-        state = namespace["fpv_status"](self.node)
-        self.assertFalse(state["enabled"])
-        self.assertFalse(state["remote_controlled"])
-        self.assertIsNone(state["rc_enabled"])
-        self.fpv.set_enabled.assert_not_called()
-
-    def test_a_is_absolute_and_repeated_heartbeats_do_not_toggle(self):
-        self.frame(1)
-        for _ in range(5):
-            self.frame(1)
-        self.frame(2)
-        for _ in range(5):
-            self.frame(2)
-        self.frame(1)
-        self.assertEqual([call.args for call in self.fpv.set_enabled.call_args_list], [(False,), (True,), (False,)])
-        state = namespace["fpv_status"](self.node)
-        self.assertTrue(state["remote_controlled"])
-        self.assertFalse(state["rc_enabled"])
-
-    def test_disconnect_releases_web_without_starting_or_stopping(self):
-        self.frame(2)
-        self.fpv.set_enabled.reset_mock()
-        self.frame(0)
-        self.assertFalse(namespace["fpv_status"](self.node)["remote_controlled"])
-        self.fpv.set_enabled.assert_not_called()
-
-    def test_stale_receiver_releases_web_and_reconnect_applies_a(self):
-        with patch.object(time, "monotonic", return_value=100.):
-            self.frame(2)
-        with patch.object(time, "monotonic", return_value=101.):
-            self.assertFalse(namespace["fpv_status"](self.node)["remote_controlled"])
-            self.frame(1)
-        self.fpv.set_enabled.assert_called_with(False)
-
-    def test_invalid_state_and_camera_conflict_do_not_start(self):
-        self.frame(3)
-        self.camera.status.return_value["enabled"] = True
-        self.frame(2)
-        self.fpv.set_enabled.assert_not_called()
-
-
-class FpvHttpTests(unittest.TestCase):
+class WebHttpTests(unittest.TestCase):
     def setUp(self):
         self.camera = Mock()
-        self.camera.status.return_value = {"enabled": False}
-        self.fpv = Mock()
-        self.fpv.status.return_value = {"enabled": False, "available": True, "message": ""}
-        self.fpv.set_enabled.return_value = {"success": True, "enabled": True, "available": True}
-        self.ready = Mock(return_value=False)
+        self.camera.status.return_value = {"enabled": False, "message": ""}
+        self.ready = Mock(return_value=True)
         self.network = Mock()
+        self.network.address = "192.168.1.20"
         self.node = SimpleNamespace(
-            robot="robot-b", share_root=source.parent, web_root=source.parent,
-            camera=self.camera, fpv=self.fpv, controller_ready=self.ready, network=self.network,
-            _capture_lock=threading.RLock(), get_logger=lambda: Mock(),
-            fpv_remote=False,
+            robot="robot-b", web_root=source.parent,
+            camera=self.camera, controller_ready=self.ready, network=self.network, get_logger=lambda: Mock(),
+            status=lambda: {"application": "unitree-go2-sdk", "robot": "robot-b", "connected": self.ready()},
+            stop=Mock(),
         )
-        self.node.fpv_status = lambda: {**self.fpv.status(), "remote_controlled": self.node.fpv_remote,
-                                        "rc_enabled": False if self.node.fpv_remote else None}
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), namespace["handler"](self.node))
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -431,21 +359,48 @@ class FpvHttpTests(unittest.TestCase):
         connection = HTTPConnection(*self.server.server_address, timeout=3)
         body = None if payload is None else json.dumps(payload)
         try:
-            connection.request("GET" if body is None else "POST", "/api/robots/robot-b/" + suffix,
+            path = suffix if suffix.startswith("/") else "/api/robots/robot-b/" + suffix
+            connection.request("GET" if body is None else "POST", path,
                                body=body, headers={"X-Go2-Application": "unitree-go2-sdk", **(headers or {})})
             response = connection.getresponse()
             return response.status, json.loads(response.read())
         finally:
             connection.close()
 
-    def test_status_and_capture_work_without_motion_controller(self):
-        self.assertEqual(self.request("fpv/status"), (200, self.node.fpv_status()))
-        self.assertEqual(self.request("fpv/capture", {"enabled": True})[0], 200)
-        self.fpv.set_enabled.assert_called_once_with(True)
-        self.assertEqual(self.request("mode", {"mode": "terrain"})[0], 503)
+    def test_camera_can_be_closed_when_motion_controller_is_offline(self):
+        self.ready.return_value = False
+        for prefix in ("", "/api/"):
+            with self.subTest(prefix=prefix):
+                self.camera.set_enabled.reset_mock()
+                self.assertEqual(self.request(prefix + "camera/status"), (200, self.camera.status()))
+                self.assertEqual(self.request(prefix + "camera/toggle", {"enabled": False})[0], 200)
+                self.camera.set_enabled.assert_called_once_with(False)
+                self.camera.set_enabled.reset_mock()
+                self.assertEqual(self.request(prefix + "camera/toggle", {"enabled": True})[0], 503)
+                self.camera.set_enabled.assert_not_called()
+
+    def test_camera_preview_returns_player_address(self):
+        self.camera.set_enabled.return_value = True
+        self.camera.status.return_value = {"enabled": True, "webrtc_port": 8889}
+        for prefix in ("", "/api/"):
+            with self.subTest(prefix=prefix):
+                self.camera.set_enabled.reset_mock()
+                self.assertEqual(self.request(prefix + "camera/toggle", {"enabled": True}),
+                                 (200, {"enabled": True, "webrtc_port": 8889, "webrtc_host": "192.168.1.20"}))
+                self.camera.set_enabled.assert_called_once_with(True)
+
+    def test_camera_toggle_rejects_invalid_payload(self):
+        for payload in ({}, {"enabled": "yes"}, [], {"enabled": 1}):
+            self.assertEqual(self.request("camera/toggle", payload)[0], 400)
+        self.camera.set_enabled.assert_not_called()
+
+    def test_missing_camera_returns_actionable_failure(self):
+        self.camera.set_enabled.return_value = False
+        self.camera.status.return_value = {"enabled": False, "message": "未识别到 USB 摄像头"}
+        self.assertEqual(self.request("camera/toggle", {"enabled": True}),
+                         (503, {"error": "未识别到 USB 摄像头"}))
 
     def test_removed_mode_is_rejected_without_calling_controller(self):
-        self.ready.return_value = True
         self.node.mode_client = Mock()
         self.node.set_mode = lambda mode: namespace["set_mode"](self.node, mode)
         for mode in ("run", "heart", "right_flip"):
@@ -457,29 +412,31 @@ class FpvHttpTests(unittest.TestCase):
     def test_rejected_post_does_not_corrupt_next_request(self):
         for suffix, headers, expected in (
             ("mode", {}, 503),
-            ("fpv/capture", {"X-Go2-Application": "wrong-client"}, 409),
+            ("stop", {"X-Go2-Application": "wrong-client"}, 409),
             ("unknown", {}, 404),
         ):
             with self.subTest(suffix=suffix, headers=headers):
                 connection = HTTPConnection(*self.server.server_address, timeout=3)
                 try:
                     # Exercise an accepted POST first, on the same connection.
-                    connection.request("POST", "/api/robots/robot-b/fpv/capture",
-                                       json.dumps({"enabled": False}),
+                    self.ready.return_value = True
+                    connection.request("POST", "/api/robots/robot-b/stop",
+                                       json.dumps({}),
                                        {"X-Go2-Application": "unitree-go2-sdk"})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     response.read()
+                    self.ready.return_value = False
                     connection.request("POST", "/api/robots/robot-b/" + suffix,
                                        json.dumps({"mode": "terrain"}),
                                        {"X-Go2-Application": "unitree-go2-sdk", **headers})
                     response = connection.getresponse()
                     self.assertEqual(response.status, expected)
                     response.read()
-                    connection.request("GET", "/api/robots/robot-b/fpv/status")
+                    connection.request("GET", "/api/robots/robot-b/status")
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
-                    self.assertEqual(json.loads(response.read()), self.node.fpv_status())
+                    self.assertEqual(json.loads(response.read()), self.node.status())
                 finally:
                     connection.close()
 
@@ -488,87 +445,17 @@ class FpvHttpTests(unittest.TestCase):
             with self.subTest(length=length):
                 connection = HTTPConnection(*self.server.server_address, timeout=3)
                 try:
-                    connection.request("POST", "/api/robots/robot-b/fpv/capture", "{}",
+                    connection.request("POST", "/api/robots/robot-b/stop", "{}",
                                        {"X-Go2-Application": "unitree-go2-sdk", "Content-Length": length})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 400)
                     self.assertIn("error", json.loads(response.read()))
-                    connection.request("GET", "/api/robots/robot-b/fpv/status")
+                    connection.request("GET", "/api/robots/robot-b/status")
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
                     response.read()
                 finally:
                     connection.close()
-
-    def test_disabled_native_status_and_web_request_never_start_pipeline(self):
-        self.fpv = FpvProcess("fpv_sky", str(source), 8081)
-        self.node.fpv = self.fpv
-        self.node.fpv_status = lambda: namespace["fpv_status"](self.node)
-        with patch.object(subprocess, "Popen") as start, patch.object(shutil, "which") as probe:
-            status, state = self.request("fpv/status")
-            self.assertEqual(status, 200)
-            self.assertEqual(state["mode"], "native")
-            self.assertFalse(state["available"])
-            self.assertFalse(state["control_enabled"])
-            status, result = self.request("fpv/capture", {"enabled": True})
-            self.assertEqual(status, 503)
-            self.assertFalse(result["enabled"])
-            self.assertEqual(result["message"], "图传暂未启用")
-            self.assertEqual(self.request("fpv/capture", {"enabled": False})[0], 200)
-            start.assert_not_called()
-            probe.assert_not_called()
-
-    def test_legacy_client_cannot_control_sdk_service(self):
-        for identity in ("", "unitree-go2-gitlab"):
-            status, _body = self.request("fpv/capture", {"enabled": True},
-                                         {"X-Go2-Application": identity})
-            self.assertEqual(status, 409)
-        self.fpv.set_enabled.assert_not_called()
-
-    def test_remote_connected_makes_web_read_only_even_when_a_is_off(self):
-        self.node.fpv_remote = True
-        state = self.request("fpv/status")[1]
-        self.assertTrue(state["remote_controlled"])
-        self.assertFalse(state["rc_enabled"])
-        self.assertEqual(self.request("fpv/capture", {"enabled": True})[0], 409)
-        self.assertEqual(self.request("fpv/capture", {"enabled": False})[0], 409)
-        self.fpv.set_enabled.assert_not_called()
-        self.node.fpv_remote = False
-        self.assertEqual(self.request("fpv/capture", {"enabled": True})[0], 200)
-
-    def test_invalid_capture_payload_does_not_start(self):
-        for payload in ({"enabled": 1}, {"enabled": "true"}, {}, []):
-            self.assertEqual(self.request("fpv/capture", payload)[0], 400)
-        self.fpv.set_enabled.assert_not_called()
-
-    def test_camera_preview_blocks_capture_start_but_allows_stop(self):
-        self.camera.status.return_value["enabled"] = True
-        self.assertEqual(self.request("fpv/capture", {"enabled": True})[0], 409)
-        self.fpv.set_enabled.assert_not_called()
-        self.assertEqual(self.request("fpv/capture", {"enabled": False})[0], 200)
-        self.fpv.set_enabled.assert_called_once_with(False)
-
-    def test_capture_blocks_camera_preview(self):
-        self.ready.return_value = True
-        self.fpv.status.return_value["enabled"] = True
-        self.assertEqual(self.request("camera/toggle", {"enabled": True})[0], 409)
-        self.camera.set_enabled.assert_not_called()
-
-    def test_missing_camera_returns_actionable_failure(self):
-        self.ready.return_value = True
-        self.camera.set_enabled.return_value = False
-        self.camera.status.return_value = {"enabled": False, "message": "未识别到 USB 摄像头"}
-        self.assertEqual(self.request("camera/toggle", {"enabled": True}),
-                         (503, {"error": "未识别到 USB 摄像头"}))
-
-    def test_failed_capture_returns_failure_state(self):
-        self.fpv.set_enabled.return_value = {"success": False, "enabled": False, "message": "missing camera"}
-        self.assertEqual(self.request("fpv/capture", {"enabled": True}),
-                         (503, self.fpv.set_enabled.return_value))
-
-    def test_wrong_robot_header_does_not_start(self):
-        self.assertEqual(self.request("fpv/capture", {"enabled": True}, {"X-Go2-Robot": "go2"})[0], 409)
-        self.fpv.set_enabled.assert_not_called()
 
 
 if __name__ == "__main__":

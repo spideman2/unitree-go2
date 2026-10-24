@@ -1049,6 +1049,7 @@ void MotorBank::run_leg(std::size_t leg_index) {
 
             auto next_sweep = SteadyClock::now();
             while (running_.load()) {
+                const auto sweep_started_at = SteadyClock::now();
                 bool sweep_failed = false;
                 for (std::size_t local_index = 0; local_index < kMotorsPerLeg && running_.load(); ++local_index) {
                     if (!running_.load())
@@ -1205,11 +1206,16 @@ void MotorBank::run_leg(std::size_t leg_index) {
                     runtime.previous_sweep_completed_at = completed_at;
                 }
 
-                // Native UARTs pace flip episodes only. Keep the other backends' timing.
-                const auto sweep_period = command_watchdog_ && (!native_uart_ || flip_uart_pacing) ?
-                    std::chrono::milliseconds(native_uart_ ? 5 : 10) : std::chrono::milliseconds(0);
+                // Normal native-UART sweeps cover all three motors at most once
+                // per millisecond. Keep flip pacing and other backends unchanged.
+                const bool pace_native = native_uart_ && !flip_uart_pacing;
+                const auto sweep_period = pace_native ? std::chrono::milliseconds(1) :
+                    (command_watchdog_ ? std::chrono::milliseconds(native_uart_ ? 5 : 10) :
+                        std::chrono::milliseconds(0));
                 if (sweep_period.count() > 0) {
-                    next_sweep += sweep_period;
+                    // Anchor to the actual start so a late wakeup cannot cause
+                    // a shorter catch-up sweep on the following iteration.
+                    next_sweep = pace_native ? sweep_started_at + sweep_period : next_sweep + sweep_period;
                     const auto now = SteadyClock::now();
                     if (next_sweep < now)
                         next_sweep = now;

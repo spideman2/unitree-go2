@@ -6,7 +6,7 @@ module: application/ros2/unitree-go2
 tests:
   - name: go2-software-regression
     description: >
-      Verifies Go2 control, ONNX policies, calibration, simulated motor transport,
+      Verifies Go2 control, ONNX policies, calibration, hardware abstraction,
       SBUS events and web APIs without real hardware.
     category: functional
     scopes: [pr, scheduled]

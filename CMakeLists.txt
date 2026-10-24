@@ -52,42 +52,28 @@ add_executable(sbus_teleop_node src/sbus_teleop_node.cpp)
 target_link_libraries(sbus_teleop_node components::rc_receiver ${typesupport})
 target_compile_options(sbus_teleop_node PRIVATE -Wall -Wextra -Wpedantic)
 ament_target_dependencies(sbus_teleop_node rclcpp rcl_interfaces geometry_msgs std_msgs std_srvs)
-add_executable(motor_brake_capture tool/1.calibration/motor_brake_capture.cpp)
+add_executable(motor_brake_capture tool/calibration/motor_brake_capture.cpp)
 target_link_libraries(motor_brake_capture go2_motor Threads::Threads)
 target_compile_options(motor_brake_capture PRIVATE -Wall -Wextra -Wpedantic)
 install(TARGETS go2_node sbus_teleop_node DESTINATION lib/${PROJECT_NAME})
-install(TARGETS motor_brake_capture DESTINATION lib/${PROJECT_NAME}/tool/1.calibration)
-install(DIRECTORY config launch resources DESTINATION share/${PROJECT_NAME})
+install(TARGETS motor_brake_capture DESTINATION lib/${PROJECT_NAME}/tool/calibration)
+install(DIRECTORY config launch resources DESTINATION share/${PROJECT_NAME}
+        PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE)
 install(DIRECTORY clients/web DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY policy DESTINATION share/${PROJECT_NAME} OPTIONAL
         FILES_MATCHING PATTERN "*.onnx")
-install(PROGRAMS scripts/print_joint_angles.py
-        scripts/web_teleop_server.py scripts/go2_network.py
+install(PROGRAMS scripts/web_teleop_server.py scripts/go2_network.py
         scripts/download_models_go2.py
-        scripts/start-go2.sh scripts/wifi.sh scripts/ap.sh DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS tool/1.calibration/calibrate_robot.py DESTINATION lib/${PROJECT_NAME}/tool/1.calibration)
-install(FILES tool/1.calibration/calibration_pose_e.yaml
-        tool/1.calibration/calibration_pose_xyz.yaml
-        tool/1.calibration/CALIBRATION.md
-        DESTINATION share/${PROJECT_NAME}/tool/1.calibration)
-install(DIRECTORY tool/1.calibration/assets DESTINATION share/${PROJECT_NAME}/tool/1.calibration)
-install(FILES README.md MODEL_SOURCES.md LICENSE NOTICE DESTINATION share/${PROJECT_NAME})
-install(DIRECTORY LICENSES DESTINATION share/${PROJECT_NAME})
+        scripts/start-go2.sh DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS tool/calibration/calibrate_robot.py DESTINATION lib/${PROJECT_NAME}/tool/calibration)
+install(FILES tool/calibration/calibration_pose_xyz.yaml
+        tool/calibration/CALIBRATION.md
+        DESTINATION share/${PROJECT_NAME}/tool/calibration)
+install(DIRECTORY tool/calibration/assets DESTINATION share/${PROJECT_NAME}/tool/calibration)
+install(FILES README.md LICENSE NOTICE
+        DESTINATION share/${PROJECT_NAME})
 if(BUILD_TESTING)
   set(GO2_TEST_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/policy" CACHE PATH "Go2 test model assets")
-  # The transport regression creates fake driver objects using motor's internal
-  # ABI. This source-tree dependency is limited to the test, not the application.
-  if(NOT SROBOTIS_ROOT)
-    set(SROBOTIS_ROOT "$ENV{SROBOTIS_ROOT}")
-  endif()
-  if(NOT SROBOTIS_ROOT)
-    get_filename_component(SROBOTIS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
-  endif()
-  find_path(GO2_MOTOR_TEST_INCLUDE_DIR NAMES motor_core.h
-    HINTS "${SROBOTIS_ROOT}/components/peripherals/motor/src")
-  if(NOT GO2_MOTOR_TEST_INCLUDE_DIR)
-    message(FATAL_ERROR "RPMsg tests require components/peripherals/motor/src/motor_core.h")
-  endif()
   add_executable(sbus_event_test test/sbus_event_test.cpp)
   target_link_libraries(sbus_event_test components::rc_receiver ${typesupport})
   target_compile_options(sbus_event_test PRIVATE -UNDEBUG)
@@ -95,19 +81,17 @@ if(BUILD_TESTING)
   add_test(NAME go2_sbus_event COMMAND sbus_event_test)
   set_tests_properties(go2_sbus_event PROPERTIES TIMEOUT 15 ENVIRONMENT "ROS_DOMAIN_ID=197;ROS_LOCALHOST_ONLY=1")
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
-  add_test(NAME go2_web_fpv COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_web_fpv.py)
-  set_tests_properties(go2_web_fpv PROPERTIES TIMEOUT 15)
+  add_test(NAME go2_web_teleop COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/web_teleop_test.py)
+  set_tests_properties(go2_web_teleop PROPERTIES TIMEOUT 15)
   add_test(NAME go2_calibration COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/calibration_test.py)
-  add_test(NAME go2_brake_capture COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/brake_capture_test.py $<TARGET_FILE:motor_brake_capture>)
-  set_tests_properties(go2_brake_capture PROPERTIES TIMEOUT 15)
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/calibration_test.py --capture-tool $<TARGET_FILE:motor_brake_capture>)
+  set_tests_properties(go2_calibration PROPERTIES TIMEOUT 30)
   add_test(NAME go2_board_profiles COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/board_profiles_test.py ${CMAKE_CURRENT_SOURCE_DIR})
   add_library(no_hardware_io SHARED test/no_hardware_io.c)
   target_link_libraries(no_hardware_io dl)
-  foreach(test_name policy policy_config controller hardware rpmsg skill)
+  foreach(test_name policy controller hardware skill)
     add_executable(${test_name}_test test/${test_name}_test.cpp)
     target_link_libraries(${test_name}_test PRIVATE go2_control)
     target_compile_options(${test_name}_test PRIVATE -UNDEBUG)
@@ -118,8 +102,7 @@ if(BUILD_TESTING)
     add_test(NAME go2_${test_name} COMMAND ${test_name}_test "${GO2_TEST_MODEL_DIR}")
     set_tests_properties(go2_${test_name} PROPERTIES TIMEOUT 30)
   endforeach()
-  target_include_directories(rpmsg_test PRIVATE "${GO2_MOTOR_TEST_INCLUDE_DIR}")
-  set_tests_properties(go2_hardware go2_rpmsg PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:no_hardware_io>")
+  set_tests_properties(go2_hardware PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:no_hardware_io>")
 endif()
 ament_export_dependencies(rosidl_default_runtime)
 ament_package()

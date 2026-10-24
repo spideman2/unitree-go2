@@ -203,7 +203,7 @@ Node::Node() : rclcpp::Node("go2") {
     const auto share = ament_index_cpp::get_package_share_directory("unitree_go2");
     const auto model_path = parameter(*this, "model_path", share + "/policy");
     const auto policy_config = parameter(*this, "policy_config", share + "/config/policies.yaml");
-    c.sit_reference = load_sit_reference(share + "/resources/motions/12.go2_sit.motion");
+    c.sit_reference = load_sit_reference(share + "/resources/motions/go2_sit.motion");
     c.policy_adapter = std::make_shared<PolicyAdapter>(policy_config, model_path);
     controller_ = std::make_unique<Controller>(c);
     hardware_ = std::make_unique<Hardware>(h);

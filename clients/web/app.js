@@ -17,18 +17,12 @@
   const axes = [0, 0, 0];
   const heldKeys = new Set();
   const driveKeys = new Set(["KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE"]);
-  // The standalone simple package is intended for a trusted local network;
-  // unlike v9 it does not require a per-process access token.
-  let token = "simple";
   let pendingMode = null;
   let selectedMode = "terrain";
   let sending = false;
   let cameraEnabled = false;
-  let fpvEnabled = false;
-  let fpvAvailable = false;
-  let fpvPending = false;
-  let fpvRemote = false;
-  let fpvRevision = 0;
+  let cameraPending = false;
+  let cameraRevision = 0;
   let controlSource = "web";
   let selectedRobot = null;
   let robotOnline = false;
@@ -47,11 +41,7 @@
 
   const $ = (selector) => document.querySelector(selector);
   const connection = $("#connection");
-  const tokenDialog = $("#token-dialog");
-  const tokenInput = $("#token-input");
-  const tokenError = $("#token-error");
   const lightToggle = $("#light-toggle");
-  const fpvToggle = $("#fpv-toggle");
   const cameraToggle = $("#camera-toggle");
   const cameraStream = $("#camera-stream");
   const cameraPlaceholder = $("#camera-placeholder");
@@ -193,8 +183,8 @@
     document.querySelectorAll(".action-button").forEach((button) => {
       button.disabled = !controlEnabled() || sending;
     });
-    lightToggle.disabled = cameraToggle.disabled = !robotOnline || switchingRobot;
-    fpvToggle.disabled = !selectedRobot || switchingRobot || fpvPending || fpvRemote || (!fpvAvailable && !fpvEnabled);
+    cameraToggle.disabled = switchingRobot || cameraPending || (!robotOnline && !cameraEnabled);
+    lightToggle.disabled = !robotOnline || switchingRobot;
   }
 
   function renderRobots() {
@@ -284,9 +274,8 @@
     sending = false;
     robotOnline = false;
     cameraEnabled = false;
-    fpvPending = false;
-    fpvRevision++;
-    showFpv({ enabled: false, available: false, message: "正在读取图传状态" });
+    cameraPending = false;
+    cameraRevision++;
     cameraStream.removeAttribute("src");
     cameraStream.hidden = true;
     cameraPlaceholder.hidden = false;
@@ -433,55 +422,12 @@
     }
   }
 
-  function showFpv(state) {
-    fpvRemote = state?.remote_controlled === true;
-    fpvEnabled = fpvRemote ? state?.rc_enabled === true : state?.enabled === true;
-    fpvAvailable = state?.available === true;
-    fpvToggle.textContent = fpvPending ? "图传切换中…" : fpvEnabled ? "关闭图传" : "打开图传";
-    if (fpvRemote && !fpvPending) fpvToggle.textContent = fpvEnabled ? "遥控器 A：图传开" : "遥控器 A：图传关";
-    if (state?.control_enabled === false) fpvToggle.textContent = "图传暂未启用";
-    fpvToggle.classList.toggle("selected", fpvEnabled);
-    fpvToggle.setAttribute("aria-pressed", String(fpvEnabled));
-    fpvToggle.title = state?.message || (fpvRemote ? "遥控器已连接，请通过 A 开关图传" : fpvAvailable ? "控制天空端图传进程" : "图传服务不可用");
-    updateControls();
-  }
-
-  async function toggleFpv() {
-    if (fpvToggle.disabled) return;
-    const generation = robotGeneration;
-    const target = selectedRobot;
-    fpvPending = true;
-    fpvRevision++;
-    fpvToggle.textContent = "图传切换中…";
-    updateControls();
-    try {
-      const response = await request(api("fpv/capture", target), {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !fpvEnabled }),
-      }, 5000);
-      if (generation !== robotGeneration) return;
-      if (typeof response.payload.enabled === "boolean") showFpv(response.payload);
-      if (!response.ok || !response.payload.success)
-        throw new Error(response.payload.message || response.payload.error || "图传切换失败");
-    } catch (error) {
-      if (generation === robotGeneration) $("#page-status").textContent = error.message;
-    } finally {
-      if (generation === robotGeneration) {
-        fpvPending = false;
-        fpvRevision++;
-        fpvToggle.textContent = fpvEnabled ? "关闭图传" : "打开图传";
-        updateControls();
-        checkStatus();
-      }
-    }
-  }
-
   async function checkStatus() {
     if (!selectedRobot || switchingRobot) return;
     const generation = robotGeneration;
     if (checkingStatus === generation) return;
     checkingStatus = generation;
-    const revision = fpvRevision;
+    const previewRevision = cameraRevision;
     try {
       const response = await request(api("status"), { cache: "no-store" });
       if (generation !== robotGeneration) return;
@@ -499,7 +445,7 @@
         if (!streamAlive()) controlSource = source;
         updateControls();
         showLight(Boolean(payload.white_light_enabled));
-        if (!fpvPending && revision === fpvRevision) showFpv(payload.fpv);
+        if (!cameraPending && previewRevision === cameraRevision) showCamera(payload.camera);
       } else {
         connectControl();
       }
@@ -580,9 +526,33 @@
     element.addEventListener("go2-stick-reset", () => release());
   }
 
+  function showCamera(state) {
+    if (typeof state?.enabled !== "boolean") return;
+    cameraEnabled = state.enabled;
+    cameraToggle.textContent = cameraEnabled ? "关闭摄像头" : "打开摄像头";
+    cameraToggle.classList.toggle("selected", cameraEnabled);
+    cameraToggle.setAttribute("aria-pressed", String(cameraEnabled));
+    cameraPlaceholder.hidden = cameraEnabled;
+    cameraStream.hidden = !cameraEnabled;
+    cameraStatus.textContent = state.message || (cameraEnabled ? "摄像头已打开" : "摄像头关闭");
+    if (cameraEnabled && state.webrtc_host) {
+      const player = new URL(window.location.href);
+      player.hostname = state.webrtc_host;
+      player.port = String(state.webrtc_port);
+      player.pathname = "/camera";
+      player.search = "?controls=false&muted=true&autoplay=true&playsInline=true";
+      player.hash = "";
+      if (cameraStream.getAttribute("src") !== player.href) cameraStream.src = player.href;
+    } else if (!cameraEnabled) cameraStream.removeAttribute("src");
+    updateControls();
+  }
+
   async function toggleCamera() {
-    if (!robotOnline || switchingRobot) return;
+    if (cameraToggle.disabled) return;
     const generation = robotGeneration;
+    cameraPending = true;
+    cameraRevision++;
+    updateControls();
     flash(cameraToggle);
     try {
       const response = await request(api("camera/toggle"), {
@@ -593,48 +563,19 @@
       }, 9000);
       const payload = response.payload;
       if (generation !== robotGeneration) return;
-      if (!response.ok) throw new Error(payload.error || "camera error");
-      cameraEnabled = Boolean(payload.enabled);
-      cameraToggle.textContent = cameraEnabled ? "关闭摄像头" : "打开摄像头";
-      cameraToggle.classList.toggle("selected", cameraEnabled);
-      cameraPlaceholder.hidden = cameraEnabled;
-      cameraStream.hidden = !cameraEnabled;
-      cameraStatus.textContent = cameraEnabled ? "摄像头已打开" : "摄像头关闭";
-      if (cameraEnabled) {
-        const player = new URL(window.location.href);
-        player.hostname = payload.webrtc_host;
-        player.port = String(payload.webrtc_port);
-        player.pathname = "/camera";
-        player.search = "?controls=false&muted=true&autoplay=true&playsInline=true";
-        player.hash = "";
-        cameraStream.src = player.href;
-      } else cameraStream.removeAttribute("src");
+      if (!response.ok) throw new Error(payload.error || "摄像头预览切换失败");
+      showCamera(payload);
     } catch (error) {
-      if (generation === robotGeneration) cameraStatus.textContent = `摄像头打开失败：${error.message}`;
+      if (generation === robotGeneration) cameraStatus.textContent = `摄像头预览切换失败：${error.message}`;
+    } finally {
+      if (generation === robotGeneration) {
+        cameraPending = false;
+        cameraRevision++;
+        updateControls();
+        checkStatus();
+      }
     }
   }
-
-  tokenDialog.remove();
-
-  /* v9's token dialog is intentionally not used by the trusted local simple UI.
-  $("#connect-button").addEventListener("click", async (event) => {
-    event.preventDefault();
-    const candidate = tokenInput.value.trim();
-    if (!candidate) {
-      tokenError.textContent = "请输入访问码";
-      return;
-    }
-    token = candidate;
-    sessionStorage.setItem("go2-token", token);
-    await checkStatus();
-    if (token) {
-      tokenError.textContent = "";
-      tokenDialog.close();
-      sendCommand();
-    } else {
-      tokenError.textContent = "访问码不正确";
-    }
-  }); */
 
   connection.addEventListener("click", () => {
     if (!robotOnline) { nextConnectAt = 0; connectControl(); }
@@ -677,7 +618,6 @@
 
   cameraToggle.addEventListener("click", toggleCamera);
   lightToggle.addEventListener("click", toggleLight);
-  fpvToggle.addEventListener("click", toggleFpv);
 
   bindJoystick($("#move-stick"), "move");
   bindJoystick($("#turn-stick"), "yaw");

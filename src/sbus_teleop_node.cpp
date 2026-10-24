@@ -151,7 +151,6 @@ class SbusTeleopNode final : public rclcpp::Node {
         yaw_channel_ = channel_parameter(*this, "yaw_channel", 1);          // CH1, right stick horizontal
         e_channel_ = channel_parameter(*this, "e_channel", 5);              // CH5
         f_channel_ = channel_parameter(*this, "f_channel", 6);              // CH6
-        a_channel_ = channel_parameter(*this, "a_channel", 7);              // CH7
         b_channel_ = channel_parameter(*this, "b_channel", 8);              // CH8
         c_channel_ = channel_parameter(*this, "c_channel", 9);              // CH9
         d_channel_ = channel_parameter(*this, "d_channel", 10);             // CH10
@@ -200,7 +199,6 @@ class SbusTeleopNode final : public rclcpp::Node {
         alive_pub_ = create_publisher<std_msgs::msg::Bool>("/go2/sbus_alive", 10);
         slot_pub_ = create_publisher<std_msgs::msg::Int32>("/go2/sbus_slot", 1);
         light_client_ = create_client<std_srvs::srv::Trigger>("/go2/toggle_white_light");
-        fpv_state_pub_ = create_publisher<std_msgs::msg::Int32>("/go2/fpv/rc_state", 1);
         mode_client_ = create_client<unitree_go2::srv::SetMode>(
             shared_control_ ? "/go2/set_mode_rc" : "/go2/set_mode");
         frame_event_ = std::make_shared<SbusFrameEvent>([this](const SbusFrameEvent::Batch& batch) {
@@ -479,14 +477,12 @@ class SbusTeleopNode final : public rclcpp::Node {
         passive_requested_ = false;
 
         if (!buttons_initialized_) {
-            previous_a_ = switch_high(frame, a_channel_);
             previous_c_ = switch_high(frame, c_channel_);
             previous_d_ = switch_high(frame, d_channel_);
             buttons_initialized_ = true;
         }
 
         const auto now = received;
-        previous_a_ = switch_high(frame, a_channel_);
         const bool c_edge = button_edge(switch_high(frame, c_channel_), previous_c_, last_c_edge_, now);
         const bool d_edge = button_edge(switch_high(frame, d_channel_), previous_d_, last_d_edge_, now);
         const bool h_high = wheel_position(frame, h_channel_) == SwitchPosition::kHigh;
@@ -594,17 +590,7 @@ class SbusTeleopNode final : public rclcpp::Node {
         return connected;
     }
 
-    int fpv_rc_state(TimePoint now) const {
-        if (!valid_frame_received_ || seconds_since(last_frame_, now) > frame_timeout_ ||
-            (latest_frame_.flags & (RC_RECEIVER_FLAG_FRAME_LOST | RC_RECEIVER_FLAG_FAILSAFE)) != 0U)
-            return 0;
-        return previous_a_ ? 2 : 1;
-    }
-
     void publish_command() {
-        std_msgs::msg::Int32 fpv;
-        fpv.data = fpv_rc_state(Clock::now());
-        fpv_state_pub_->publish(fpv);
         check_receiver();
         const bool fresh = valid_frame_received_ && seconds_since(last_frame_, Clock::now()) <= frame_timeout_;
         std_msgs::msg::Bool alive;
@@ -655,7 +641,7 @@ class SbusTeleopNode final : public rclcpp::Node {
     std::string device_;
     bool accept_sbus2_footer_{true};
     int forward_channel_{3}, lateral_channel_{4}, yaw_channel_{1};
-    int e_channel_{5}, f_channel_{6}, a_channel_{7}, b_channel_{8};
+    int e_channel_{5}, f_channel_{6}, b_channel_{8};
     int c_channel_{9}, d_channel_{10}, g_channel_{11}, h_channel_{12};
     int channel_min_{282}, channel_center_{1002}, channel_max_{1722};
     int switch_low_{700}, switch_high_{1300}, wheel_extreme_margin_{100};
@@ -672,7 +658,6 @@ class SbusTeleopNode final : public rclcpp::Node {
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr alive_pub_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr slot_pub_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr light_client_;
-    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr fpv_state_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr velocity_pub_;
     rclcpp::Client<unitree_go2::srv::SetMode>::SharedPtr mode_client_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -680,7 +665,7 @@ class SbusTeleopNode final : public rclcpp::Node {
     rc_receiver_frame_t latest_frame_{};
     bool have_frame_{false}, valid_frame_received_{false}, passive_requested_{false};
     bool buttons_initialized_{false};
-    bool previous_a_{false}, previous_c_{false}, previous_d_{false};
+    bool previous_c_{false}, previous_d_{false};
     int current_slot_{0};
     int pending_slot_{0};
     SwitchPosition g_position_{SwitchPosition::kMiddle};

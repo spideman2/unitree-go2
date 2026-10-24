@@ -137,15 +137,6 @@ button.danger { border-color: rgba(255,104,114,.48); color: #ffb1b6; }
 
 dialog { width: min(calc(100% - 40px), 360px); border: 1px solid var(--line); border-radius: 20px; color: var(--text); background: #142028; box-shadow: 0 30px 100px #000; }
 dialog::backdrop { background: rgba(4,9,12,.82); backdrop-filter: blur(8px); }
-dialog form { display: grid; gap: 14px; text-align: center; }
-dialog img { width: 64px; margin: 4px auto 0; }
-dialog h2, dialog p { margin: 0; }
-dialog p { color: var(--muted); }
-dialog input { width: 100%; padding: 13px; border: 1px solid var(--line); border-radius: 11px; outline: none; color: var(--text); background: #0c151b; font-size: 20px; text-align: center; letter-spacing: .16em; }
-dialog input:focus { border-color: var(--cyan); }
-dialog output { min-height: 16px; color: var(--red); }
-dialog form > button { padding: 13px; color: #071311; background: var(--cyan); }
-
 @media (max-width: 760px), (max-height: 520px) {
   .app { grid-template-columns: 22% 56% 22%; grid-template-rows: 42% 14% 12% 1fr; }
   .meta { padding: 6px 6px 0; }

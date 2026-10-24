@@ -12,26 +12,25 @@ Third-party Model Notices:
    Copyright (c) 2025 Wu Tianyang
    Licensed under the MIT License.
 
-   The third-party policy 2.go2_terrain.onnx is distributed by the author via
+   The third-party policy go2_terrain.onnx is distributed by the author via
    unitree_cpp_deploy (https://github.com/wty-yy/unitree_cpp_deploy),
    Copyright (c) 2025 wty, and the MIT-licensed model release at
    https://huggingface.co/wty-yy/go2_rl_gym_data.
    The ONNX file is renamed without modifying its contents.
 
-   Original license and copyright notices are retained verbatim in:
-   LICENSES/wty-yy-go2-rl-gym.txt
-   LICENSES/wty-yy-unitree-cpp-deploy.txt
+   Original license and copyright notices are retained verbatim in
+   LICENSE, under go2_rl_gym and unitree_cpp_deploy.
 
 ---------------------------------------------------------------------------
 Project-trained Models:
 ---------------------------------------------------------------------------
 
-The project-trained policies 1.go2_blind_rough.onnx, 10.go2_wave.onnx,
-11.go2_forward_jump.onnx and 12.go2_sit.onnx are released under the
+The project-trained policies go2_blind_rough.onnx, go2_wave.onnx,
+go2_forward_jump.onnx and go2_sit.onnx are released under the
 Apache License 2.0 in LICENSE. Training framework licenses do not replace
 the license declaration for these weights.
 
-See MODEL_SOURCES.md and config/model_manifest.yaml for model provenance,
+See README.md and model_manifest in config/policies.yaml for model provenance,
 versions and checksums. Provide these notices and the license texts with
 the SDK when distributing the separately packaged model files.
 

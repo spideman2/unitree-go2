@@ -1,4 +1,0 @@
-# 沿用图传示例地址；按实际天空端、地面端与模组地址配置。
-connections:
-  sky: {device: k3-air, device_ip: 192.168.144.108, module_ip: 192.168.144.10, connection_id: air-link}
-  ground: {device: k3-ground, device_ip: 192.168.144.101, module_ip: 192.168.144.66, connection_id: ground-link}

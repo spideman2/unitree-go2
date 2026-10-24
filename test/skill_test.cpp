@@ -27,23 +27,7 @@ void frame(go2::Controller &c, double time, bool tilted = false) {
 }
 } // namespace
 int main() {
-    const auto sit_trajectory = go2::load_sit_reference(
-        std::string(GO2_TEST_APP) + "/resources/motions/12.go2_sit.motion");
     go2::ControllerConfig config = test_controller_config();
-    config.sit_reference = sit_trajectory;
-    assert(go2::parse_mode("crouch") == Mode::kCrouch);
-    assert(go2::parse_mode("sit") == Mode::kSit);
-    assert(go2::parse_mode("wave") == Mode::kWave);
-    rejects([] { go2::parse_mode("heart"); });
-    rejects([] { go2::parse_mode("right_flip"); });
-    assert(go2::parse_mode("forward_jump") == Mode::kForwardJump);
-    assert(std::string(go2::mode_name(Mode::kCrouch)) == "crouch");
-    {
-        go2::Controller c(config);
-        assert(c.set_mode(Mode::kCrouch, fresh(1), at(1)).accepted);
-        assert(!c.prepare_policy(fresh(2), at(2)));
-        assert(c.status().mode == Mode::kCrouch);
-    }
     // Accepted actions own the wave clock. Rejected work must not skip a reference frame.
     {
         go2::Controller c(config);
@@ -104,7 +88,7 @@ int main() {
     }
     // Different normal destinations all wait for the sitting policy to rise.
     for (auto destination :
-        {Mode::kTerrain, Mode::kTerrain, Mode::kForwardJump, Mode::kStand, Mode::kCrouch, Mode::kRollover}) {
+        {Mode::kTerrain, Mode::kForwardJump, Mode::kStand, Mode::kCrouch, Mode::kRollover}) {
         go2::Controller c(config);
         start(c, Mode::kSit);
         for (unsigned n = 0; n < 200; ++n)

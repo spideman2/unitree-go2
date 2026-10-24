@@ -1,8 +1,0 @@
-schema_version: 2
-deployment_profile: profiles/k3_udp.yaml
-role: sky
-local_device: k3-air
-connections_file: connections.yaml
-camera:
-  driver: mpp_uvc
-  device: /dev/v4l/by-id/usb-DECXIN_DECXIN_Camera_01.00.000-video-index0

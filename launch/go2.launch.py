@@ -20,13 +20,22 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 def _make_node(context):
     backend = LaunchConfiguration("backend").perform(context)
+    config_path = Path(LaunchConfiguration("config").perform(context)).expanduser()
+    with config_path.open(encoding="utf-8") as stream:
+        shared = yaml.safe_load(stream)
     local_path = Path(LaunchConfiguration("local_config").perform(context)).expanduser()
     local = {}
-    if local_path.is_file():
+    if local_path.resolve() == config_path.resolve():
+        local = shared
+    elif local_path.is_file():
         with local_path.open(encoding="utf-8") as stream:
             local = yaml.safe_load(stream) or {}
     elif backend == "serial":
         raise RuntimeError(f"Missing board-local configuration: {local_path}")
+    # Take only shared settings from the bundled file; its reference calibration must
+    # never fill missing fields in an explicitly selected robot configuration.
+    defaults = {**shared["defaults"], **local.get("defaults", {})}
+    profiles = {**shared["board_profiles"], **local.get("board_profiles", {})}
     identity = local.get("robot", {})
     local_parameters = local.get("go2", {}).get("ros__parameters", {})
     board_profile = LaunchConfiguration("board_profile").perform(context) or identity.get("board_profile", "legacy_usb")
@@ -54,11 +63,7 @@ def _make_node(context):
                     or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
                            for v in values)):
                 raise RuntimeError(f"Board-local config requires 12 finite values for {key}")
-    config = LaunchConfiguration("config").perform(context)
     model = LaunchConfiguration("model").perform(context)
-    profiles_path = LaunchConfiguration("board_profiles").perform(context)
-    with open(profiles_path, encoding="utf-8") as stream:
-        profiles = yaml.safe_load(stream)
     if (
         board_profile not in ("legacy_usb", "new_smallcore", "new_bigcore", "new_usbmotor")
         or board_profile not in profiles
@@ -78,9 +83,11 @@ def _make_node(context):
     else:
         imu_driver = imu_driver or (
             {"iwt603": "drv_uart_iwt603", "bmi270": "drv_spi_bmi270"}[imu] if imu
-            else local_parameters.get("imu_driver", "drv_uart_iwt603")
+            else local_parameters.get("imu_driver", defaults.get("imu_driver", "drv_uart_iwt603"))
         )
-        motor_driver = motor_driver or local_parameters.get("motor_driver", "drv_485_m8010a")
+        motor_driver = motor_driver or local_parameters.get(
+            "motor_driver", defaults.get("motor_driver", "drv_485_m8010a")
+        )
         board_parameters["motor_driver"] = motor_driver
     # Mounting rotations apply consistently to attitude and sensor vectors.
     # A per-robot absolute calibration replaces the fallback, without applying it twice.
@@ -117,8 +124,8 @@ def _make_node(context):
             name="go2",
             output="screen",
             parameters=[
-                config,
                 {
+                    **defaults,
                     **board_parameters,
                     "robot": ParameterValue(robot, value_type=str),
                     "teleop_source": teleop_source,
@@ -168,7 +175,6 @@ def _make_node(context):
                         ),
                         "e_channel": ParameterValue(LaunchConfiguration("sbus_e_channel"), value_type=int),
                         "f_channel": ParameterValue(LaunchConfiguration("sbus_f_channel"), value_type=int),
-                        "a_channel": ParameterValue(LaunchConfiguration("sbus_a_channel"), value_type=int),
                         "b_channel": ParameterValue(LaunchConfiguration("sbus_b_channel"), value_type=int),
                         "c_channel": ParameterValue(LaunchConfiguration("sbus_c_channel"), value_type=int),
                         "d_channel": ParameterValue(LaunchConfiguration("sbus_d_channel"), value_type=int),
@@ -207,12 +213,6 @@ def _make_node(context):
                 parameters=[
                     {
                         "web_port": int(LaunchConfiguration("web_port").perform(context)),
-                        "fpv_control_enabled": ParameterValue(
-                            LaunchConfiguration("fpv_control_enabled"), value_type=bool
-                        ),
-                        "fpv_executable": LaunchConfiguration("fpv_executable"),
-                        "fpv_config": LaunchConfiguration("fpv_config"),
-                        "fpv_control_port": int(LaunchConfiguration("fpv_control_port").perform(context)),
                         "shared_control": sbus_enabled and web_enabled,
                         "web_root": str(Path(get_package_share_directory("unitree_go2")) / "web"),
                         "robot": ParameterValue(robot, value_type=str),
@@ -252,22 +252,22 @@ def generate_launch_description():
     share = Path(get_package_share_directory("unitree_go2"))
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "config", default_value=str(share / "config/robot.yaml"),
+                description="Shared runtime defaults and board profiles",
+            ),
             DeclareLaunchArgument("robot", default_value="", description="Override the board-local robot ID"),
             DeclareLaunchArgument("ros_domain_id", default_value="", description="Override the board-local DDS domain"),
             DeclareLaunchArgument(
                 "local_config",
                 default_value=EnvironmentVariable("GO2_LOCAL_CONFIG", default_value="/etc/unitree-go2/robot.yaml"),
-                description="Board-local identity, calibration and hardware overrides",
+                description="Board-local robot identity and calibration",
             ),
             DeclareLaunchArgument(
                 "motion_log_path",
                 default_value="/tmp/go2_motion.csv",
                 description="Motion CSV path; empty disables recording",
             ),
-            DeclareLaunchArgument(
-                "config", default_value=str(share / "config/go2.yaml"), description="Shared Go2 parameters"
-            ),
-            DeclareLaunchArgument("board_profiles", default_value=str(share / "config/board_profiles.yaml")),
             DeclareLaunchArgument("backend", default_value="mock", choices=["mock", "serial"]),
             DeclareLaunchArgument("motor_driver", default_value=""),
             DeclareLaunchArgument(
@@ -288,16 +288,6 @@ def generate_launch_description():
             DeclareLaunchArgument("policy_config", default_value=str(share / "config/policies.yaml")),
             DeclareLaunchArgument("web", default_value="false", choices=["true", "false"]),
             DeclareLaunchArgument("web_port", default_value="8082"),
-            DeclareLaunchArgument(
-                "fpv_control_enabled",
-                default_value=EnvironmentVariable("GO2_FPV_CONTROL_ENABLED", default_value="false"),
-                choices=["true", "false"],
-            ),
-            DeclareLaunchArgument("fpv_executable", default_value=str(share.parent.parent / "bin/fpv_sky")),
-            DeclareLaunchArgument(
-                "fpv_config", default_value=str(share / "config/fpv/sky.yaml")
-            ),
-            DeclareLaunchArgument("fpv_control_port", default_value="8081"),
             DeclareLaunchArgument("network_mode", default_value="wifi", choices=["wifi", "ap"]),
             DeclareLaunchArgument("wifi_connection", default_value=""),
             DeclareLaunchArgument("ap_address", default_value="10.0.91.250/23"),
@@ -313,7 +303,6 @@ def generate_launch_description():
             DeclareLaunchArgument("sbus_right_vertical_channel", default_value="2"),
             DeclareLaunchArgument("sbus_e_channel", default_value="5"),
             DeclareLaunchArgument("sbus_f_channel", default_value="6"),
-            DeclareLaunchArgument("sbus_a_channel", default_value="7"),
             DeclareLaunchArgument("sbus_b_channel", default_value="8"),
             DeclareLaunchArgument("sbus_c_channel", default_value="9"),
             DeclareLaunchArgument("sbus_d_channel", default_value="10"),

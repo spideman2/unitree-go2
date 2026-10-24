@@ -16,7 +16,7 @@
     <main class="app">
       <section class="panel camera">
         <div class="camera-heading">
-          <b>摄像头</b>
+          <b>摄像头预览</b>
           <button id="camera-toggle" type="button">打开摄像头</button>
         </div>
         <div class="camera-frame">
@@ -57,7 +57,6 @@
         <button class="action-button" type="button" data-mode="crouch">蹲下</button>
         <button class="action-button" type="button" data-mode="rollover">翻身</button>
         <button id="light-toggle" type="button" aria-pressed="false">打开白灯</button>
-        <button id="fpv-toggle" type="button" disabled aria-pressed="false" title="正在读取图传状态">打开图传</button>
         <button class="page-button selected" type="button" data-page="0">1</button>
         <button class="page-button" type="button" data-page="1">2</button>
         <button class="page-button" type="button" data-page="2">3</button>
@@ -84,7 +83,7 @@
     <dialog id="robots-dialog" aria-labelledby="robots-title">
       <div class="robots-heading"><b id="robots-title">机器狗列表</b><button id="robots-close" type="button">关闭</button></div>
       <div id="robots-list" class="robots-list"></div>
-      <p class="robots-help">Wi-Fi 模式请连接 JDSK；热点模式请连接对应机器狗的热点。</p>
+      <p class="robots-help">Wi-Fi 模式请与机器狗连接同一网络；热点模式请连接对应机器狗的热点。</p>
     </dialog>
 
     <aside id="rotate-prompt" class="rotate-prompt" aria-live="polite">
@@ -95,17 +94,6 @@
         <button id="enter-landscape" type="button">进入横屏</button>
       </div>
     </aside>
-
-    <dialog id="token-dialog">
-      <form method="dialog">
-        <img src="/icon.svg" alt="">
-        <h2>连接 K3</h2>
-        <p>输入启动日志中显示的访问码</p>
-        <input id="token-input" inputmode="numeric" autocomplete="one-time-code" maxlength="64" placeholder="访问码">
-        <output id="token-error"></output>
-        <button id="connect-button" value="default">连接遥控器</button>
-      </form>
-    </dialog>
 
     <script src="/app.js" defer></script>
   </body>

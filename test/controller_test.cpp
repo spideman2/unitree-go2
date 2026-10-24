@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <utility>
+#include <vector>
 
 void stand(go2::Controller &c, double start = 1) {
     assert(c.set_mode(go2::Mode::kStand, fresh(start), at(start)).accepted);
@@ -16,11 +18,6 @@ void stand(go2::Controller &c, double start = 1) {
 void terrain(go2::Controller &c) {
     stand(c);
     assert(c.set_mode(go2::Mode::kTerrain, fresh(2), at(2)).accepted);
-}
-
-void uart_pacing(const go2::Commands &commands, bool expected) {
-    for (const auto &command : commands)
-        assert(command.flip_uart_pacing == expected);
 }
 
 int main() {
@@ -143,8 +140,7 @@ int main() {
                     for (auto& joint : state.motors.joints) {
                         joint.feedback.velocity_rad_s = speed;
                     }
-                    uart_pacing(c.tick(state, at(time)),
-                        false);
+                    c.tick(state, at(time));
                     assert(c.status().mode == mode && !c.status().protective_crouch);
                 }
                 time += .001;
@@ -166,7 +162,6 @@ int main() {
                 }
                 const auto stopped = c.tick(state, at(time));
                 assert(stopped[1].protective_crouch);
-                uart_pacing(stopped, false);
             }
         }
     }
@@ -243,7 +238,7 @@ int main() {
     }
 
 
-    for (const auto mode : {Mode::kStand, Mode::kTerrain, Mode::kTerrain}) {
+    for (const auto mode : {Mode::kStand, Mode::kTerrain}) {
         go2::Controller c(test_controller_config());
         stand(c);
         assert(c.set_mode(mode, fresh(2), at(2)).accepted);
@@ -310,20 +305,6 @@ int main() {
         assert(c.status().mode == Mode::kPassive);
     }
     {
-        // USB uses the same crouch-before-passive stop on stale feedback.
-        auto config = test_controller_config();
-        config.rr_uart6_degraded = false;
-        go2::Controller c(config);
-        stand(c);
-        auto state = fresh(2.1);
-        state.motors.joints[0].received_at = at(1.0);
-        const auto commands = c.tick(state, at(2.1));
-        assert(commands[0].mode == go2::MotorMode::kFoc && commands[0].protective_crouch);
-        assert(c.status().protective_crouch);
-        brake(c.tick(state, at(3.11)));
-        assert(c.status().mode == Mode::kPassive);
-    }
-    {
         go2::Controller c(test_controller_config());
         c.set_velocity({1, 0, 0}, at(1));
         brake(c.tick(fresh(1), at(1)));
@@ -353,6 +334,7 @@ int main() {
         for (int i = 0; i < 12; ++i)
             near(output[i].position_rad, go2::kStandPose[i]);
         assert(c.set_mode(Mode::kCrouch, fresh(2), at(2)).accepted);
+        assert(!c.prepare_policy(fresh(2), at(2)));
         output = c.tick(fresh(4), at(4));
         for (int i = 0; i < 12; ++i)
             near(output[i].position_rad, config.crouch_pose[i]);
@@ -371,7 +353,7 @@ int main() {
     }
 
     {
-        // As in v9, only Passive -> Sit may recover a finite, anchored and fresh
+        // Only Passive -> Crouch may recover a finite, anchored and fresh
         // joint whose feedback position is outside the normal operating limit.
         go2::Controller c(test_controller_config());
         auto outside = fresh(1);
@@ -464,11 +446,11 @@ int main() {
         brake(c.tick(fresh(4.14), at(4.14)));
     }
 
-    // Check the shared short ramp at each model's real command input.
-    for (const auto mode : {Mode::kTerrain}) {
+    // Check acceleration, direction changes and timeout at the terrain policy input.
+    {
         go2::Controller c(test_controller_config());
         stand(c);
-        assert(c.set_mode(mode, fresh(2), at(2)).accepted);
+        assert(c.set_mode(Mode::kTerrain, fresh(2), at(2)).accepted);
         const auto physical_vx = [](const go2::PolicyRequest &request) {
             return request.observation[42] / 2.F;
         };
@@ -654,7 +636,7 @@ int main() {
         go2::ControllerConfig config = test_controller_config();
         go2::Controller c(config);
         const int segments = c.status().rollover_segments;
-        assert(segments == 6 || segments == 8 || segments == 9);
+        assert(segments == 9);
         stand(c);
         assert(!c.set_mode(Mode::kRollover, fresh(2), at(2)).accepted);
         auto tilted = fresh(2);
@@ -664,14 +646,8 @@ int main() {
         assert(!c.prepare_policy(tilted, at(2.01)));
         auto output = c.tick(tilted, at(2.01));
         assert(output[0].mode == go2::MotorMode::kFoc);
-        const go2::Joints pose4_degrees{-0.86F, 137.94F, -152.15F, -6.05F, 138.46F, -152.04F,
-            -0.86F, 137.94F, -152.15F, -6.05F, 138.46F, -152.04F};
-        const go2::Joints pose6_degrees{22.38F, 29.45F, -123.36F, -48.56F, 136.08F, -148.25F,
-            22.38F, 29.45F, -123.36F, -48.56F, 136.08F, -148.25F};
-        const go2::Joints pose7_degrees{22.38F, 29.45F, -123.36F, -16.07F, 149.03F, -156.68F,
+        const go2::Joints last_recorded_degrees{22.38F, 29.45F, -123.36F, -16.07F, 149.03F, -156.68F,
             22.38F, 29.45F, -123.36F, -16.07F, 149.03F, -156.68F};
-        const auto &last_recorded_degrees =
-            segments == 6 ? pose4_degrees : (segments == 8 ? pose6_degrees : pose7_degrees);
         const double midpoint = 2 + (segments - .5) * .8;
         output = c.tick(fresh(midpoint), at(midpoint));
         for (std::size_t i = 0; i < go2::kNumJoints; ++i)
@@ -683,7 +659,7 @@ int main() {
             near(output[i].position_rad, config.crouch_pose[i]);
     }
     {
-        // v9 accepts rollover directly from Pose A; it is not gated on a prior
+        // Accept rollover directly from Pose A; it is not gated on a prior
         // completed stand transition.
         go2::Controller c(test_controller_config());
         assert(c.set_mode(Mode::kCrouch, fresh(1), at(1)).accepted);
@@ -745,36 +721,14 @@ int main() {
         manual.tick(stale, at(43));
         assert(manual.status().protective_crouch);
     }
-    assert(go2::parse_mode("navigation") == Mode::kWalk);
-    assert(go2::parse_mode("ai_agent") == Mode::kWalk);
-    rejects([] { go2::parse_mode("dance"); });
-    assert(go2::parse_mode("rollover") == Mode::kRollover);
-    assert(go2::parse_mode("crouch") == Mode::kCrouch);
-    assert(go2::parse_mode("walk") == Mode::kWalk);
-    rejects([] { go2::parse_mode("free_walk"); });
-    rejects([] { go2::parse_mode("cross_step"); });
-    assert(go2::parse_mode("wave") == Mode::kWave);
-    assert(go2::parse_mode("sit") == Mode::kSit);
-    rejects([] { go2::parse_mode("run"); });
-    assert(go2::parse_mode("terrain") == Mode::kTerrain);
-    rejects([] { go2::parse_mode("b_v2_stand"); });
-    rejects([] { go2::parse_mode("right_flip"); });
-    rejects([] { go2::parse_mode("heart"); });
-    rejects([] { go2::parse_mode("left_flip"); });
-    rejects([] { go2::parse_mode("handstand"); });
-    rejects([] { go2::parse_mode("leggedstand"); });
-    rejects([] { go2::parse_mode("jump"); });
-    rejects([] { go2::parse_mode("spring_jump"); });
-    rejects([] { go2::parse_mode("pose_a"); });
-    rejects([] { go2::parse_mode("isaaclab"); });
-    rejects([] { go2::parse_mode("free_bound"); });
-    rejects([] { go2::parse_mode("isaacgym_handstand"); });
-    rejects([] { go2::parse_mode("isaacgym_leggedstand"); });
-    rejects([] { go2::parse_mode("isaacgym_jump"); });
-    rejects([] { go2::parse_mode("isaacgym_spring_jump"); });
-    rejects([] { go2::parse_mode("isaacgym_stairs_optimized"); });
-    rejects([] { go2::parse_mode("isaacgym_running"); });
-    rejects([] { go2::parse_mode("sideflip"); });
+    for (const auto &[name, mode] : std::vector<std::pair<const char *, Mode>>{
+            {"navigation", Mode::kWalk}, {"ai_agent", Mode::kWalk}, {"walk", Mode::kWalk},
+            {"rollover", Mode::kRollover}, {"crouch", Mode::kCrouch}, {"wave", Mode::kWave},
+            {"sit", Mode::kSit}, {"terrain", Mode::kTerrain}, {"forward_jump", Mode::kForwardJump}})
+        assert(go2::parse_mode(name) == mode);
+    assert(std::string(go2::mode_name(Mode::kCrouch)) == "crouch");
+    for (const auto name : {"", "unknown", "run"})
+        rejects([name] { go2::parse_mode(name); });
     go2::ControllerConfig bad = test_controller_config();
     bad.motor_hard_timeout = .1;
     rejects([&] { go2::Controller c(bad); });

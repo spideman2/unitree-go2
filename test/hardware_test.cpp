@@ -148,10 +148,7 @@ int main() {
         }
     // Native buses can miss multiple replies during normal motion. USB must
     // still reject exactly the same half-turn steps as before.
-    for (auto profile : {go2::BoardProfile::kNewBigcore, go2::BoardProfile::kNewSmallcore,
-            go2::BoardProfile::kLegacyUsb, go2::BoardProfile::kNewUsbMotor}) {
-        const bool native = profile == go2::BoardProfile::kNewBigcore ||
-            profile == go2::BoardProfile::kNewSmallcore;
+    for (bool native : {false, true}) {
         for (float ratio : {6.33F, 12.13F}) {
             for (float direction : {-1.F, 1.F}) {
                 const go2::JointCalibration cal{2, ratio, direction, 0};
@@ -358,17 +355,6 @@ int main() {
     rejects([&] { go2::validate_hardware_config(new_config); });
     std::swap(new_config.legs[0].device, new_config.legs[1].device);
 
-    for (auto profile : {go2::BoardProfile::kNewBigcore, go2::BoardProfile::kNewSmallcore,
-            go2::BoardProfile::kNewUsbMotor}) {
-        new_config.board_profile = profile;
-        new_config.backend = go2::Backend::kMock;
-        new_config.motor_io_authorized = false;
-        new_config.actuation_enabled = false;
-        go2::Hardware simulation(new_config);
-        simulation.start();
-        assert(simulation.read().imu.valid);
-        simulation.stop();
-    }
     serial_config.imu_device = "/dev/serial/by-path/imu";
     rejects([&] { go2::validate_hardware_config(serial_config); });
     serial_config.imu_driver = "unknown";

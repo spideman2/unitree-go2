@@ -4,8 +4,7 @@ install/
 log/
 logs/
 output/
-**/.gradle/
-**/__pycache__/
+__pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
@@ -13,10 +12,8 @@ output/
 .vscode/
 
 # Runtime model assets are downloaded from the SpacemiT model archive.
-/models/
 /policy/
 *.onnx
 *.mnn
 *.apk
-**/local.properties
-**/.kotlin/
+!/clients/android/go2-web.apk
